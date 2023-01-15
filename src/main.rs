@@ -1,13 +1,12 @@
 use gio;
-use gio::{prelude::ApplicationExtManual, traits::ApplicationExt, Application, ApplicationFlags};
+use gio::{prelude::*, traits::ApplicationExt, Application, ApplicationFlags};
+use glib::{g_log, MainContext, Priority};
 use gsettings_macro::gen_settings;
-use glib::g_log;
-use log::info;
 use std::{
     error::Error,
     process::{Child, Command},
-    sync::mpsc,
 };
+use swayipc;
 
 struct Manager {
     power_settings: PowerSettings,
@@ -27,19 +26,16 @@ impl Manager {
             power_settings: PowerSettings::new("org.gnome.settings-daemon.plugins.power"),
         }
     }
-    pub fn run(mut self) -> Result<(), Box<dyn Error>> {
-        let (send_reload_event, recv_reload_event) = mpsc::channel::<()>();
-        let (session_settings_tx, session_settings_rx) = mpsc::channel::<SessionSettings>();
+    pub fn run(self) -> Result<(), Box<dyn Error>> {
+        let (send_reload_event, recv_reload_event) = MainContext::channel(Priority::default());
 
         // Send initial Reload
         send_reload_event.send(()).expect("Failed to send reload");
+        self.power_settings.handle_power_btn_action_change()?;
 
         let send_reload_cb = || {
             let tx_cpy = send_reload_event.clone();
-            g_log!(glib::LogLevel::Warning,"Callback created");
-            
             return move |_: &PowerSettings| {
-                g_log!(glib::LogLevel::Warning,"Callback executed");
                 tx_cpy.send(()).expect("Cannot reload config");
             };
         };
@@ -60,11 +56,7 @@ impl Manager {
                 s.handle_power_btn_action_change()
                     .expect("Failed to set Power button action")
             });
-        self.session_settings.connect_idle_delay_changed(move |s| {
-            println!("idle delay changed");
-            session_settings_tx
-                .send(s.clone())
-                .expect("Cannot reload idle settings");
+        self.session_settings.connect_idle_delay_changed(move |_| {
             send_reload_event
                 .clone()
                 .send(())
@@ -72,12 +64,8 @@ impl Manager {
         });
         let mut sway_idle_child: Option<Child> = None;
 
-        for _ in recv_reload_event {
-            self.session_settings = match session_settings_rx.try_recv() {
-                Ok(s) => s,
-                Err(_) => self.session_settings,
-            };
-            if let Some(mut prev_child) = sway_idle_child {
+        let reload_sway_config = move |()| {
+            if let Some(prev_child) = sway_idle_child.as_mut() {
                 prev_child
                     .kill()
                     .unwrap_or_else(|e| println!("Cannot kill swayidle: {e}"));
@@ -88,12 +76,18 @@ impl Manager {
                 .args(swayidle_args)
                 .spawn();
             sway_idle_child = child.ok();
-            g_log!(glib::LogLevel::Warning,"Command Executed");
-        }
+            g_log!(glib::LogLevel::Info, "Swayidle Reloaded");
+            glib::Continue(true)
+        };
+
+        recv_reload_event.attach(None, reload_sway_config);
+
         Ok(())
     }
     fn get_swayidle_args(&self) -> Vec<String> {
         let mut args = Vec::new();
+        let display_off = format!("swaymsg output '*' dpms off");
+        let display_on = format!("swaymsg output '*' dpms on");
         if self.power_settings.idle_dim() {
             let idle_brightness = self.power_settings.idle_brightness();
             let action = format!(
@@ -180,11 +174,14 @@ impl Manager {
             }
         }
 
-        let lock_screen = format!("$(trawlcat i3-wm.program.lock gtklock)");
-        let before_sleep = lock_screen.clone();
+        let lock_screen = format!("$(trawlcat i3-wm.program.lock 'gtklock -d')");
+        let before_sleep = format!("{display_off};{lock_screen}; sleep 0.1");
+        let after_resume = display_on.clone();
         let mut before_sleep_args = vec!["before-sleep".to_owned(), before_sleep];
+        let mut after_resum_args = vec!["after-resume".to_owned(), after_resume];
         let mut lock_screen_args = vec!["lock".to_owned(), lock_screen];
         args.append(&mut before_sleep_args);
+        args.append(&mut after_resum_args);
         args.append(&mut lock_screen_args);
         args
     }
@@ -202,21 +199,53 @@ impl Manager {
     }
 }
 
+#[derive(Debug)]
+enum KeySymAction {
+    Unbind { key: String },
+    ReBind { key: String, action: String },
+}
+
+const POWER_OFF_KEY: &str = "XF86Poweroff";
+
 impl PowerSettings {
+    /// Requires settings HandlePowerKey=ignore in logind.conf
     fn handle_power_btn_action_change(&self) -> Result<(), Box<dyn Error>> {
         use PowerButtonAction::*;
-        match self.power_button_action() {
-            Nothing => todo!(),
-            Suspend => todo!(),
-            Hibernate => todo!(),
-            Interactive => todo!(),
-        }
+        let mut sway_conn = swayipc::Connection::new()?;
+        use KeySymAction::*;
+        let btn_change_action = match self.power_button_action() {
+            Nothing => Unbind {
+                key: POWER_OFF_KEY.to_string(),
+            },
+            Suspend => ReBind {
+                key: POWER_OFF_KEY.to_string(),
+                action: "systemctl suspend".to_string(),
+            },
+            Hibernate => ReBind {
+                key: POWER_OFF_KEY.to_string(),
+                action: "systemctl hibernate".to_string(),
+            },
+            Interactive => todo!("Implement interactive selection"),
+        };
+
+        match btn_change_action {
+            Unbind { ref key } => sway_conn.run_command(format!("unbindsym {key}"))?,
+            ReBind {
+                ref key,
+                ref action,
+            } => {
+                let _ = sway_conn.run_command(format!("unbindsym {key}"));
+                sway_conn.run_command(format!("bindsym {key} exec {action}"))?
+            }
+        };
+
+        Ok(())
     }
 }
 fn main() {
     std::env::set_var("RUST_LOG", "info");
     pretty_env_logger::init();
-    let app = Application::new(Some("org.regolith.inputd"), ApplicationFlags::IS_SERVICE);
+    let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
     let manager = Manager::new();
     manager.run().expect("Failed to run");
     app.hold();
