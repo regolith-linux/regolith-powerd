@@ -5,13 +5,23 @@ Maintainer: Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>
 Rules-Requires-Root: no
 Build-Depends:
  debhelper-compat (= 13),
+ pkg-config,
+ libglib2.0-dev,
+ libglib2.0-0,
+ cargo,
 Standards-Version: 4.6.1
 Homepage: https://github.com/regolith-linux/regolith-powerd
-#Vcs-Git: https://salsa.debian.org/debian/regolith-powerd.git
 
 Package: regolith-powerd
-Architecture: all
+Architecture: any
 Depends:
  ${misc:Depends},
-Description: <insert up to 60 chars description>
- <Insert long description, indented with spaces.>
+ libglib2.0-0,
+ swayidle,
+ sway | sway-regolith,
+ light,
+ gnome-session-bin,
+ powermgmt-base,
+ trawldb,
+ systemd,
+Description: Daemon for using swayidle
