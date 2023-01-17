@@ -247,8 +247,6 @@ impl PowerSettings {
     }
 }
 fn main() {
-    std::env::set_var("RUST_LOG", "info");
-    pretty_env_logger::init();
     let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
     let manager = Manager::new();
     manager.run().expect("Failed to run");
