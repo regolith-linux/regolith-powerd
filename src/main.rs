@@ -225,7 +225,11 @@ impl PowerSettings {
                 key: POWER_OFF_KEY.to_string(),
                 action: "systemctl hibernate".to_string(),
             },
-            Interactive => todo!("Implement interactive selection"),
+            Interactive => ReBind { 
+                key: POWER_OFF_KEY.to_string(), 
+                // TODO: Replace with a more sensible action (Prefferably user defined)
+                action: "swaynag -t warning -m 'Do you really want to shutdown' -b 'Shutdown' '/usr/bin/gnome-session-quit --power-off --no-prompt'".to_string() 
+            }
         };
 
         match btn_change_action {
@@ -235,7 +239,7 @@ impl PowerSettings {
                 ref action,
             } => {
                 let _ = sway_conn.run_command(format!("unbindsym {key}"));
-                sway_conn.run_command(format!("bindsym {key} exec {action}"))?
+                sway_conn.run_command(format!("bindsym {key} exec \"{action}\""))?
             }
         };
 
