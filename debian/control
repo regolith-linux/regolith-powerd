@@ -24,4 +24,19 @@ Depends:
  powermgmt-base,
  trawldb,
  systemd,
+Recommends: logind-ignore-lidswitch, logind-ignore-powerkey
 Description: Daemon for using swayidle
+
+Package: logind-ignore-lidswitch
+Architecture: any
+Depends:
+ ${misc:Depends},
+ systemd
+Description: Configuration for systemd-logind to set HandleLidSwitch action to ignore
+
+Package: logind-ignore-powerkey
+Architecture: any
+Depends:
+ ${misc:Depends},
+ systemd
+Description: Configuration for systemd-logind to set HandlePowerKey action to ignore
