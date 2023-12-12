@@ -1,0 +1,1 @@
+data/35_ignore_lidswitch.conf usr/lib/systemd/logind.conf.d
