@@ -89,6 +89,7 @@ impl Manager {
 
         Ok(())
     }
+
     fn get_swayidle_args(&self) -> Vec<String> {
         let mut args = Vec::new();
         let display_off = format!("swaymsg output '*' dpms off");
@@ -255,6 +256,6 @@ fn main() {
     let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
     let manager = Manager::new();
     manager.run().expect("Failed to run");
-    app.hold();
+    let _ = app.hold();
     app.run();
 }
