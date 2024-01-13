@@ -124,7 +124,7 @@ impl Manager {
                 Shutdown => (Some("poweroff"), None),
                 Logout => (Some("gnome-session-quit --no-prompt"), None),
                 Interactive => todo!("Show some gui prompt to the user"),
-                Nothing => (None, None),
+                _ => (None, None),
             }
         };
         let (idle_action_bat_opt, resume_action_bat_opt) = {
@@ -139,7 +139,7 @@ impl Manager {
                 Shutdown => (Some("poweroff"), None),
                 Logout => (Some("gnome-session-quit --no-prompt"), None),
                 Interactive => todo!("Show some gui prompt to the user"),
-                Nothing => (None, None),
+                _ => (None, None),
             }
         };
 
