@@ -3,6 +3,7 @@ use glib::g_log;
 use gsettings_macro::gen_settings;
 use std::{
     error::Error,
+    mem::ManuallyDrop,
     process::{Child, Command},
 };
 use swayipc;
@@ -35,14 +36,16 @@ impl Manager {
         let (send_reload_event, recv_reload_event) = async_channel::bounded(1);
 
         // Send initial Reload
-        send_reload_event.send_blocking(()).expect("Failed to send reload");
+        send_reload_event
+            .send_blocking(())
+            .expect("Failed to send reload");
         self.power_settings.handle_power_btn_action_change()?;
 
         let send_reload_cb = || {
             let tx_cpy = send_reload_event.clone();
             return move |_: &PowerSettings| {
                 tx_cpy.send_blocking(()).expect("Cannot reload config");
-            }
+            };
         };
 
         self.power_settings
@@ -68,8 +71,8 @@ impl Manager {
                 .send_blocking(())
                 .expect("Failed to reload");
         });
-        let mut sway_idle_child: Option<Child> = None;
 
+        let mut sway_idle_child: Option<Child> = None;
         glib::spawn_future_local(async move {
             while let Ok(_) = recv_reload_event.recv().await {
                 if let Some(prev_child) = sway_idle_child.as_mut() {
@@ -84,7 +87,7 @@ impl Manager {
                     .spawn();
                 sway_idle_child = child.ok();
                 g_log!(glib::LogLevel::Info, "Swayidle Reloaded");
-            };
+            }
         });
 
         Ok(())
@@ -231,8 +234,8 @@ impl PowerSettings {
                 key: POWER_OFF_KEY.to_string(),
                 action: "systemctl hibernate".to_string(),
             },
-            Interactive => ReBind { 
-                key: POWER_OFF_KEY.to_string(), 
+            Interactive => ReBind {
+                key: POWER_OFF_KEY.to_string(),
                 // TODO: Replace with a more sensible action (Prefferably user defined)
                 action: "swaynag -t warning -m 'Do you really want to shutdown' -b 'Shutdown' '/usr/bin/gnome-session-quit --power-off --no-prompt'".to_string() 
             }
@@ -254,8 +257,9 @@ impl PowerSettings {
 }
 fn main() {
     let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
+    let hold_guard = ManuallyDrop::new(app.hold());
     let manager = Manager::new();
     manager.run().expect("Failed to run");
-    let _ = app.hold();
     app.run();
+    let _ = ManuallyDrop::into_inner(hold_guard);
 }
