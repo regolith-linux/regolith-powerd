@@ -1,6 +1,5 @@
-use gio;
-use gio::{prelude::*, traits::ApplicationExt, Application, ApplicationFlags};
-use glib::{g_log, MainContext, Priority};
+use gio::{prelude::*, Application, ApplicationFlags};
+use glib::g_log;
 use gsettings_macro::gen_settings;
 use std::{
     error::Error,
@@ -27,18 +26,19 @@ impl Manager {
         }
     }
     pub fn run(self) -> Result<(), Box<dyn Error>> {
-        let (send_reload_event, recv_reload_event) = MainContext::channel(Priority::default());
+        let (send_reload_event, recv_reload_event) = async_channel::bounded(1);
 
         // Send initial Reload
-        send_reload_event.send(()).expect("Failed to send reload");
+        send_reload_event.send_blocking(()).expect("Failed to send reload");
         self.power_settings.handle_power_btn_action_change()?;
 
         let send_reload_cb = || {
             let tx_cpy = send_reload_event.clone();
             return move |_: &PowerSettings| {
-                tx_cpy.send(()).expect("Cannot reload config");
-            };
+                tx_cpy.send_blocking(()).expect("Cannot reload config");
+            }
         };
+
         self.power_settings
             .connect_idle_brightness_changed(send_reload_cb());
         self.power_settings
@@ -59,28 +59,27 @@ impl Manager {
         self.session_settings.connect_idle_delay_changed(move |_| {
             send_reload_event
                 .clone()
-                .send(())
+                .send_blocking(())
                 .expect("Failed to reload");
         });
         let mut sway_idle_child: Option<Child> = None;
 
-        let reload_sway_config = move |()| {
-            if let Some(prev_child) = sway_idle_child.as_mut() {
-                prev_child
-                    .kill()
-                    .unwrap_or_else(|e| println!("Cannot kill swayidle: {e}"));
-            }
-            let swayidle_args = self.get_swayidle_args();
-            let child = Command::new("swayidle")
-                .arg("-w")
-                .args(swayidle_args)
-                .spawn();
-            sway_idle_child = child.ok();
-            g_log!(glib::LogLevel::Info, "Swayidle Reloaded");
-            glib::Continue(true)
-        };
-
-        recv_reload_event.attach(None, reload_sway_config);
+        glib::spawn_future_local(async move {
+            while let Ok(_) = recv_reload_event.recv().await {
+                if let Some(prev_child) = sway_idle_child.as_mut() {
+                    prev_child
+                        .kill()
+                        .unwrap_or_else(|e| println!("Cannot kill swayidle: {e}"));
+                }
+                let swayidle_args = self.get_swayidle_args();
+                let child = Command::new("swayidle")
+                    .arg("-w")
+                    .args(swayidle_args)
+                    .spawn();
+                sway_idle_child = child.ok();
+                g_log!(glib::LogLevel::Info, "Swayidle Reloaded");
+            };
+        });
 
         Ok(())
     }
