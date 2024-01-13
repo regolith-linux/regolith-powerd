@@ -12,17 +12,23 @@ struct Manager {
     session_settings: SessionSettings,
 }
 
-#[gen_settings(file = "org.gnome.settings-daemon.plugins.power.gschema.xml")]
+#[gen_settings(
+    file = "org.gnome.settings-daemon.plugins.power.gschema.xml",
+    id = "org.gnome.settings-daemon.plugins.power"
+)]
 pub struct PowerSettings;
 
-#[gen_settings(file = "org.gnome.desktop.session.gschema.xml")]
+#[gen_settings(
+    file = "org.gnome.desktop.session.gschema.xml",
+    id = "org.gnome.desktop.session"
+)]
 pub struct SessionSettings;
 
 impl Manager {
     pub fn new() -> Self {
         Self {
-            session_settings: SessionSettings::new("org.gnome.desktop.session"),
-            power_settings: PowerSettings::new("org.gnome.settings-daemon.plugins.power"),
+            session_settings: SessionSettings::new(),
+            power_settings: PowerSettings::new(),
         }
     }
     pub fn run(self) -> Result<(), Box<dyn Error>> {
