@@ -1,0 +1,16 @@
+[Unit]
+Description=Start Regolith Power Daemon
+PartOf=graphical-session.target
+Wants=gnome-session.target
+After=gnome-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/regolith-powerd
+Restart=on-failure
+StartLimitIntervalSec=10
+StartLimitBurst=5
+
+
+[Install]
+WantedBy=regolith-wayland.target
