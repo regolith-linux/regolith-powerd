@@ -1,3 +1,16 @@
+regolith-powerd (0.3.0) focal; urgency=medium
+
+  [ Soumya Ranjan Patnaik ]
+  * chore: bump package dependencies
+  * chore: replace depricated use of MainContext::channel with async_channel
+  * refactor: specify id in gen_settings proc macro and not while creating gsettings objects
+  * fix: handle case when idle action is not defined for bat or ac
+  * lint: unused return value from app.hold()
+  * fix: manually drop app hold to ensure the daemon doesn't quit
+  * feat: add systemd service
+
+ -- Soumya Ranjan Patniak <soumyaranjan1812@gmail.com>  Mon, 03 Jun 2024 02:19:01 +0530
+
 regolith-powerd (0.2.0) focal; urgency=medium
 
   [ Soumya Ranjan Patnaik ]
