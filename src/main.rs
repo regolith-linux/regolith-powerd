@@ -8,6 +8,8 @@ use std::{
 };
 use swayipc;
 
+mod logind;
+
 struct Manager {
     power_settings: PowerSettings,
     session_settings: SessionSettings,
@@ -257,9 +259,17 @@ impl PowerSettings {
 }
 fn main() {
     let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
-    let hold_guard = ManuallyDrop::new(app.hold());
+
+    // Setup holds for event loop and logind inhibit
+    let hold = (app.hold(), logind::setup_logind_inhibits());
+
+    // Keep the hold guard alive until the end of the program
+    let hold_guard = ManuallyDrop::new(hold);
+
     let manager = Manager::new();
     manager.run().expect("Failed to run");
     app.run();
+
+    // Drop the hold guard
     let _ = ManuallyDrop::into_inner(hold_guard);
 }
