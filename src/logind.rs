@@ -1,8 +1,8 @@
 use zbus::blocking::Connection;
 use zbus::zvariant::OwnedFd;
-use zbus::{proxy, Result};
+use zbus::{dbus_proxy, Result};
 
-#[proxy(
+#[dbus_proxy(
     interface = "org.freedesktop.login1.Manager",
     default_service = "org.freedesktop.login1",
     default_path = "/org/freedesktop/login1"
