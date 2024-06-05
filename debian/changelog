@@ -3,7 +3,7 @@ regolith-powerd (0.3.1) focal; urgency=medium
   [ Soumya Ranjan Patnaik ]
   * feat: prevent logind actions for power key and lid
 
- -- Soumya Ranjan Patniak <soumyaranjan1812@gmail.com>  Wed, 05 Jun 2024 19:24:15 +0530
+ -- Regolith Linux <regolith.linux@gmail.com>  Wed, 05 Jun 2024 09:31:17 -0700
 
 regolith-powerd (0.3.0) focal; urgency=medium
 
