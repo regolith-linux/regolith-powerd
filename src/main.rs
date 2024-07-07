@@ -185,7 +185,7 @@ impl Manager {
             }
         }
 
-        let lock_screen = format!("$(trawlcat i3-wm.program.lock 'gtklock -d')");
+        let lock_screen = format!("$(trawlcat wm.program.lock loginctl lock-session)");
         let before_sleep = format!("{display_off};{lock_screen}; sleep 0.1");
         let after_resume = display_on.clone();
         let mut before_sleep_args = vec!["before-sleep".to_owned(), before_sleep];
