@@ -185,8 +185,9 @@ impl Manager {
             }
         }
 
-        let lock_screen = format!("$(trawlcat i3-wm.program.lock 'gtklock -d')");
-        let before_sleep = format!("{display_off};{lock_screen}; sleep 0.1");
+        let default_lock = format!("gtklock -d --background $(trawlcat regolith.lockscreen.wallpaper.file /dev/null)");
+        let lock_screen = format!("$(trawlcat wm.program.lock \"{default_lock}\")");
+        let before_sleep = format!("{display_off};{lock_screen}; sleep 1");
         let after_resume = display_on.clone();
         let mut before_sleep_args = vec!["before-sleep".to_owned(), before_sleep];
         let mut after_resum_args = vec!["after-resume".to_owned(), after_resume];
