@@ -24,4 +24,5 @@ Depends:
  powermgmt-base,
  trawldb,
  systemd,
+ playerctl,
 Description: Daemon for using swayidle
