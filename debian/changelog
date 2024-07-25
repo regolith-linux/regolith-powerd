@@ -1,3 +1,10 @@
+regolith-powerd (0.4.0) jammy; urgency=medium
+
+  [ Soumya Ranjan Patnaik ]
+  * feat: pause all audio players before suspend
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Thu, 25 Jul 2024 04:19:34 -0700
+
 regolith-powerd (0.3.3) jammy; urgency=medium
 
   [ Soumya Ranjan Patnaik ]
