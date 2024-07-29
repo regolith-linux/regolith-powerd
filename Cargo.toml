@@ -1,9 +1,9 @@
 [package]
 name = "regolith-powerd"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 license = "GPL-3.0+"
-authors = ["Soumya Ranjan Patniak <soumyaranjan1812@gmail.com>", "Ken Gilmer <kgilmer@gmail.com>"]
+authors = ["Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>", "Ken Gilmer <kgilmer@gmail.com>"]
 description = "Power Settings Daemeon for Regolith Wayland Session"
 repository = "https://github.com/regolith-linux/regolith-powerd"
 
