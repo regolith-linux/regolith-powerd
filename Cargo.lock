@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "regolith-powerd"
-version = "0.3.5"
+version = "0.3.9"
 dependencies = [
  "async-channel",
  "gio",
