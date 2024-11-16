@@ -1,9 +1,9 @@
 [package]
 name = "regolith-powerd"
-version = "0.3.3"
+version = "0.3.9"
 edition = "2021"
 license = "GPL-3.0+"
-authors = ["Soumya Ranjan Patniak <soumyaranjan1812@gmail.com>", "Ken Gilmer <kgilmer@gmail.com>"]
+authors = ["Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>", "Ken Gilmer <kgilmer@gmail.com>"]
 description = "Power Settings Daemeon for Regolith Wayland Session"
 repository = "https://github.com/regolith-linux/regolith-powerd"
 
@@ -13,6 +13,6 @@ repository = "https://github.com/regolith-linux/regolith-powerd"
 async-channel = "2.1.1"
 gio = "0.18.4"
 glib = "0.18.5"
-gsettings-macro = "0.1.20"
+gsettings-macro = "0.2.1"
 swayipc = "3.0.1"
-zbus = "3.15.2"
+zbus = "4.4.0"

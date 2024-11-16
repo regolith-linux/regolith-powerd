@@ -1,2 +1,0 @@
-target/release/regolith-powerd    usr/bin
-data/regolith-init-powerd.service usr/lib/systemd/user/
