@@ -1,3 +1,17 @@
+regolith-powerd (0.5.0) jammy; urgency=medium
+
+  [ Soumya Ranjan Patnaik ]
+  * chore: update Cargo.toml to match debian
+
+  [ Khosrow Moossavi ]
+  * feat: enable github action to test pull requests
+  * feat: enable github action to publish to unstable
+  * feat: enable github action to publish to testing
+  * feat: enable github action to prepare release
+  * fix: create release tag from correct git sha
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Mon, 03 Feb 2025 21:08:52 +0000
+
 regolith-powerd (0.4.0) jammy; urgency=medium
 
   [ Soumya Ranjan Patnaik ]
