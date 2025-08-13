@@ -99,10 +99,11 @@ impl Manager {
         let mut args = Vec::new();
         let display_off = format!("swaymsg output '*' dpms off");
         let display_on = format!("swaymsg output '*' dpms on");
+
         let default_lock = format!(
             "gtklock -d --background $(trawlcat regolith.lockscreen.wallpaper.file /dev/null)"
         );
-        let lock_screen = format!("$(trawlcat wm.program.lock \"{default_lock}\")");
+        let lock_screen = format!("$(trawlcat wm.program.lock_sway \"{default_lock}\")");
 
         if self.power_settings.idle_dim() {
             let idle_brightness = self.power_settings.idle_brightness();
@@ -248,7 +249,7 @@ impl PowerSettings {
             Interactive => ReBind {
                 key: POWER_OFF_KEY.to_string(),
                 // TODO: Replace with a more sensible action (Prefferably user defined)
-                action: "swaynag -t warning -m 'Do you really want to shutdown' -b 'Shutdown' '/usr/bin/gnome-session-quit --power-off --no-prompt'".to_string() 
+                action: "swaynag -t warning -m 'Do you really want to shutdown' -b 'Shutdown' '/usr/bin/gnome-session-quit --power-off --no-prompt'".to_string()
             }
         };
 
