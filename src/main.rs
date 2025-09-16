@@ -99,6 +99,11 @@ impl Manager {
         let mut args = Vec::new();
         let display_off = format!("swaymsg output '*' dpms off");
         let display_on = format!("swaymsg output '*' dpms on");
+        let default_lock = format!(
+            "gtklock -d --background $(trawlcat regolith.lockscreen.wallpaper.file /dev/null)"
+        );
+        let lock_screen = format!("$(trawlcat wm.program.lock \"{default_lock}\")");
+
         if self.power_settings.idle_dim() {
             let idle_brightness = self.power_settings.idle_brightness();
             let action = format!(
@@ -108,12 +113,16 @@ impl Manager {
                 if [ 1 -eq "$(echo "${{curr_brightness}} > {idle_brightness}" | bc)" ]; then
                     light -S {idle_brightness}
                 fi
+                sleep 5
+                {display_off}
+                {lock_screen}
                 "#,
             );
             let timeout = self.session_settings.idle_delay();
             let mut swayidle_timeout_args = Self::get_timeout_cmd(timeout, &action);
-            let mut swayidle_resume_args =
-                Self::get_resume_cmd("light -S $(cat $XDG_RUNTIME_DIR/screen_brightness_old.var)");
+            let mut swayidle_resume_args = Self::get_resume_cmd(&format!(
+                "{display_on}; light -S $(cat $XDG_RUNTIME_DIR/screen_brightness_old.var)"
+            ));
             args.append(&mut swayidle_timeout_args);
             args.append(&mut swayidle_resume_args);
         }
@@ -185,8 +194,6 @@ impl Manager {
             }
         }
 
-        let default_lock = format!("gtklock -d --background $(trawlcat regolith.lockscreen.wallpaper.file /dev/null)");
-        let lock_screen = format!("$(trawlcat wm.program.lock \"{default_lock}\")");
         let pause_audio = format!("playerctl -a pause");
         let before_sleep = format!("{display_off};{lock_screen};{pause_audio};sleep 1");
         let after_resume = display_on.clone();
