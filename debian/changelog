@@ -1,3 +1,13 @@
+regolith-powerd (0.6.0) jammy; urgency=medium
+
+  [ Khosrow Moossavi ]
+  * feat: use build-only to test pull request
+
+  [ Soumya Ranjan Patnaik ]
+  * feat: autolock 5 seconds after idle timeout
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sun, 19 Oct 2025 15:15:23 +0000
+
 regolith-powerd (0.5.0) jammy; urgency=medium
 
   [ Soumya Ranjan Patnaik ]
