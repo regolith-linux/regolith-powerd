@@ -116,6 +116,7 @@ impl Manager {
                 fi
                 sleep 5
                 {display_off}
+                sleep 5
                 {lock_screen}
                 "#,
             );
