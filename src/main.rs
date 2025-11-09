@@ -115,6 +115,7 @@ impl Manager {
                 fi
                 sleep 5
                 {display_off}
+                sleep 5
                 {lock_screen}
                 "#,
             );
@@ -248,7 +249,7 @@ impl PowerSettings {
             Interactive => ReBind {
                 key: POWER_OFF_KEY.to_string(),
                 // TODO: Replace with a more sensible action (Prefferably user defined)
-                action: "swaynag -t warning -m 'Do you really want to shutdown' -b 'Shutdown' '/usr/bin/gnome-session-quit --power-off --no-prompt'".to_string() 
+                action: "swaynag -t warning -m 'Do you really want to shutdown' -b 'Shutdown' '/usr/bin/gnome-session-quit --power-off --no-prompt'".to_string()
             }
         };
 
