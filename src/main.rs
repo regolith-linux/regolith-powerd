@@ -114,19 +114,31 @@ impl Manager {
                 if [ 1 -eq "$(echo "${{curr_brightness}} > {idle_brightness}" | bc)" ]; then
                     light -S {idle_brightness}
                 fi
-                sleep 5
-                {display_off}
-                sleep 5
-                {lock_screen}
                 "#,
             );
-            let timeout = self.session_settings.idle_delay();
-            let mut swayidle_timeout_args = Self::get_timeout_cmd(timeout, &action);
-            let mut swayidle_resume_args = Self::get_resume_cmd(&format!(
-                "{display_on}; light -S $(cat $XDG_RUNTIME_DIR/screen_brightness_old.var)"
+
+            // Dim screen to $idle_brightness when idle dim timeout hit
+            let dim_timeout_sec = self.session_settings.idle_delay();
+            let mut swayidle_dim_timeout_args = Self::get_timeout_cmd(dim_timeout_sec, &action);
+            let mut swayidle_dim_resume_args = Self::get_resume_cmd(&format!(
+                "light -S $(cat $XDG_RUNTIME_DIR/screen_brightness_old.var)"
             ));
-            args.append(&mut swayidle_timeout_args);
-            args.append(&mut swayidle_resume_args);
+            args.append(&mut swayidle_dim_timeout_args);
+            args.append(&mut swayidle_dim_resume_args);
+
+            // Display off at 5 seconds after dim timeout
+            let display_off_timeout_sec = dim_timeout_sec + 5;
+            let mut swayidle_display_off_timeout_args =
+                Self::get_timeout_cmd(display_off_timeout_sec, &display_off);
+            let mut swayidle_display_off_resume_args = Self::get_resume_cmd(&display_on);
+            args.append(&mut swayidle_display_off_timeout_args);
+            args.append(&mut swayidle_display_off_resume_args);
+
+            // Locked 10 seconds after dim timeout / 5 seconds after display off
+            let lock_timeout_sec = display_off_timeout_sec + 5;
+            let mut swayidle_lock_timeout_args =
+                Self::get_timeout_cmd(lock_timeout_sec, &display_off);
+            args.append(&mut swayidle_lock_timeout_args);
         }
 
         let (idle_action_ac_opt, resume_action_ac_opt) = {
