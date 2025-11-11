@@ -137,7 +137,7 @@ impl Manager {
             // Locked 10 seconds after dim timeout / 5 seconds after display off
             let lock_timeout_sec = display_off_timeout_sec + 5;
             let mut swayidle_lock_timeout_args =
-                Self::get_timeout_cmd(lock_timeout_sec, &display_off);
+                Self::get_timeout_cmd(lock_timeout_sec, &lock_screen);
             args.append(&mut swayidle_lock_timeout_args);
         }
 
