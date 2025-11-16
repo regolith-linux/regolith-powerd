@@ -242,7 +242,7 @@ enum KeySymAction {
 const POWER_OFF_KEY: &str = "XF86Poweroff";
 
 impl PowerSettings {
-    /// Requires settings HandlePowerKey=ignore in logind.conf
+    // Requires settings HandlePowerKey=ignore in logind.conf
     fn handle_power_btn_action_change(&self) -> Result<(), Box<dyn Error>> {
         use PowerButtonAction::*;
         let mut sway_conn = swayipc::Connection::new()?;
