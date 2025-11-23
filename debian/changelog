@@ -1,3 +1,16 @@
+regolith-powerd (0.7.0) jammy; urgency=medium
+
+  [ Soumya Ranjan Patnaik ]
+  * fix: prevent locking upto 5sec after display off
+  * chore!: update the Xresource key for lock program
+  * fix: swayidle doesn't resume if timeout action in-flight
+  * fix: use the correct action command for locking
+
+  [ Khosrow Moossavi ]
+  * chore: cosmetics comment cleanup
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sun, 23 Nov 2025 19:02:01 +0000
+
 regolith-powerd (0.6.0) jammy; urgency=medium
 
   [ Khosrow Moossavi ]
