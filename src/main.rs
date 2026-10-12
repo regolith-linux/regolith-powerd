@@ -283,11 +283,24 @@ impl PowerSettings {
 fn main() {
     let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
 
-    // Setup holds for event loop and logind inhibit
-    let hold = (app.hold(), logind::setup_logind_inhibits());
+    // Keep the application alive until the end of the program
+    let hold_guard = ManuallyDrop::new(app.hold());
 
-    // Keep the hold guard alive until the end of the program
-    let hold_guard = ManuallyDrop::new(hold);
+    // Take over power-key and lid-switch handling from logind for the
+    // daemon's lifetime, once the session main context starts running.
+    glib::spawn_future_local(async {
+        match logind::setup_logind_inhibits().await {
+            Ok(fd) => {
+                // Intentionally leak the fd: dropping it would release the
+                // inhibitor, and the kernel closes it when the daemon exits.
+                std::mem::forget(fd);
+            }
+            Err(e) => g_log!(
+                glib::LogLevel::Warning,
+                "Failed to acquire logind inhibitors: {e}"
+            ),
+        }
+    });
 
     let manager = Manager::new();
     manager.run().expect("Failed to run");
