@@ -25,3 +25,26 @@ pub async fn setup_logind_inhibits() -> Result<OwnedFd> {
         )
         .await
 }
+
+/// Reconcile one named inhibitor lock slot with its desired state: releases
+/// the lock (by dropping the fd) when `inhibited` is false, takes one when
+/// true and the slot is still empty. Repeated reconciliations of the same
+/// state are no-ops. Dropping the returned fd at any later point releases
+/// the inhibitor.
+pub async fn reconcile_lock(
+    lock: &mut Option<OwnedFd>,
+    proxy: &LogindProxy<'_>,
+    inhibited: bool,
+    what: &str,
+) -> Result<()> {
+    if !inhibited {
+        *lock = None;
+    } else if lock.is_none() {
+        *lock = Some(
+            proxy
+                .Inhibit(what, "regolith-powerd", "GNOME session inhibition", "block")
+                .await?,
+        );
+    }
+    Ok(())
+}

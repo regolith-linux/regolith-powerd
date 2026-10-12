@@ -9,6 +9,7 @@ use std::{
 use swayipc;
 
 mod logind;
+mod session;
 
 struct Manager {
     power_settings: PowerSettings,
@@ -301,6 +302,9 @@ fn main() {
             ),
         }
     });
+
+    // Bridge GNOME session inhibition to logind, which swayidle already honors.
+    glib::spawn_future_local(session::run_inhibits());
 
     let manager = Manager::new();
     manager.run().expect("Failed to run");
