@@ -174,13 +174,7 @@ impl Manager {
 
         if let Some(action) = idle_action_ac_opt {
             let timeout = self.power_settings.sleep_inactive_ac_timeout();
-            let on_timout = format!(
-                r#"
-            if on_ac_power; then
-                {action}
-            fi
-            "#
-            );
+            let on_timout = Self::get_power_source_cmd(PowerSource::Ac, action);
             let mut swayidle_timeout_args = Self::get_timeout_cmd(timeout as u32, &on_timout);
             args.append(&mut swayidle_timeout_args);
 
@@ -192,13 +186,7 @@ impl Manager {
 
         if let Some(action) = idle_action_bat_opt {
             let timeout = self.power_settings.sleep_inactive_battery_timeout();
-            let on_timout = format!(
-                r#"
-            if ! on_ac_power; then
-                {action}
-            fi
-            "#
-            );
+            let on_timout = Self::get_power_source_cmd(PowerSource::Battery, action);
             let mut swayidle_timout_args = Self::get_timeout_cmd(timeout as u32, &on_timout);
             args.append(&mut swayidle_timout_args);
 
@@ -231,6 +219,33 @@ impl Manager {
     fn get_resume_cmd(action: &str) -> Vec<String> {
         vec!["resume".to_owned(), action.to_owned()]
     }
+
+    /// Shell command that runs `action` only while on the given power source.
+    ///
+    /// `on_ac_power` exits 0 on mains power, 1 on battery and 255 when the
+    /// power source cannot be determined, which is what desktops without
+    /// power sensors report. Only exit status 1 means battery, so an unknown
+    /// power source gets the AC settings rather than the battery ones.
+    fn get_power_source_cmd(source: PowerSource, action: &str) -> String {
+        let test = match source {
+            PowerSource::Ac => "-ne",
+            PowerSource::Battery => "-eq",
+        };
+        format!(
+            r#"
+            on_ac_power
+            if [ $? {test} 1 ]; then
+                {action}
+            fi
+            "#
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PowerSource {
+    Ac,
+    Battery,
 }
 
 #[derive(Debug)]
@@ -295,4 +310,48 @@ fn main() {
 
     // Drop the hold guard
     let _ = ManuallyDrop::into_inner(hold_guard);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Manager, PowerSource};
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
+
+    /// Run the generated command with a stub `on_ac_power` that exits with
+    /// `exit_code`, and report whether the guarded action ran.
+    fn action_runs(source: PowerSource, exit_code: u8) -> bool {
+        let dir: PathBuf = std::env::temp_dir().join(format!(
+            "regolith-powerd-test-{}-{source:?}-{exit_code}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("on_ac_power");
+        fs::write(&stub, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cmd = Manager::get_power_source_cmd(source, "echo ran");
+        let path = format!("{}:/usr/bin:/bin", dir.display());
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        String::from_utf8_lossy(&output.stdout).trim() == "ran"
+    }
+
+    #[test]
+    fn ac_action_runs_on_ac_and_unknown_power_source() {
+        assert!(action_runs(PowerSource::Ac, 0));
+        assert!(!action_runs(PowerSource::Ac, 1));
+        assert!(action_runs(PowerSource::Ac, 255));
+    }
+
+    #[test]
+    fn battery_action_runs_only_on_battery() {
+        assert!(!action_runs(PowerSource::Battery, 0));
+        assert!(action_runs(PowerSource::Battery, 1));
+        assert!(!action_runs(PowerSource::Battery, 255));
+    }
 }
