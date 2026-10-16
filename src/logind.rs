@@ -28,25 +28,30 @@ pub async fn setup_logind_inhibits() -> Result<OwnedFd> {
         .await
 }
 
-/// Reconcile one named inhibitor lock slot with its desired state: releases
-/// the lock (by dropping the fd) when `inhibited` is false, takes one when
-/// true and the slot is still empty. Repeated reconciliations of the same
-/// state are no-ops. Dropping the returned fd at any later point releases
-/// the inhibitor.
-pub async fn reconcile_lock(
-    lock: &mut Option<OwnedFd>,
-    proxy: &LogindProxy<'_>,
-    inhibited: bool,
-    what: &str,
-) -> Result<()> {
-    if !inhibited {
-        *lock = None;
-    } else if lock.is_none() {
-        *lock = Some(
-            proxy
-                .Inhibit(what, WHO, "GNOME session inhibition", "block")
-                .await?,
-        );
+/// One named logind inhibitor lock slot. The lock is held while the slot
+/// owns an fd; dropping the fd releases the inhibitor.
+pub struct Lock {
+    what: &'static str,
+    fd: Option<OwnedFd>,
+}
+
+impl Lock {
+    pub fn new(what: &'static str) -> Self {
+        Self { what, fd: None }
     }
-    Ok(())
+
+    /// Release the lock when `wanted` is false, take it when true and not yet
+    /// held. Repeating the same state is a no-op.
+    pub async fn sync(&mut self, proxy: &LogindProxy<'_>, wanted: bool) -> Result<()> {
+        if !wanted {
+            self.fd = None;
+        } else if self.fd.is_none() {
+            self.fd = Some(
+                proxy
+                    .Inhibit(self.what, WHO, "GNOME session inhibition", "block")
+                    .await?,
+            );
+        }
+        Ok(())
+    }
 }

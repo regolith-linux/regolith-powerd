@@ -7,10 +7,9 @@ use glib::g_log;
 use std::rc::Rc;
 use std::time::Duration;
 use zbus::export::futures_util::{future, StreamExt};
-use zbus::zvariant::OwnedFd;
 use zbus::{dbus_proxy, Result};
 
-use crate::logind::{reconcile_lock, LogindProxy};
+use crate::logind::{Lock, LogindProxy};
 
 fn warn_reconcile_failed(e: zbus::Error) {
     g_log!(
@@ -41,24 +40,24 @@ pub trait SessionManager {
     fn inhibited_actions(&self) -> zbus::Result<u32>;
 }
 
-#[derive(Default)]
 struct SessionInhibitors {
-    idle: Option<OwnedFd>,
-    sleep: Option<OwnedFd>,
+    idle: Lock,
+    sleep: Lock,
 }
 
 impl SessionInhibitors {
-    async fn reconcile(&mut self, proxy: &LogindProxy<'_>, actions: u32) -> Result<()> {
-        // Reconcile independently so a failure taking one lock does not leave
-        // the other lock stale. Dropping an fd releases its inhibitor.
-        let idle = reconcile_lock(&mut self.idle, proxy, actions & INHIBIT_IDLE != 0, "idle").await;
-        let sleep = reconcile_lock(
-            &mut self.sleep,
-            proxy,
-            actions & INHIBIT_SUSPEND != 0,
-            "sleep",
-        )
-        .await;
+    fn new() -> Self {
+        Self {
+            idle: Lock::new("idle"),
+            sleep: Lock::new("sleep"),
+        }
+    }
+
+    async fn apply(&mut self, proxy: &LogindProxy<'_>, actions: u32) -> Result<()> {
+        // Sync independently so a failure taking one lock does not leave
+        // the other lock stale.
+        let idle = self.idle.sync(proxy, actions & INHIBIT_IDLE != 0).await;
+        let sleep = self.sleep.sync(proxy, actions & INHIBIT_SUSPEND != 0).await;
         idle.and(sleep)
     }
 }
@@ -87,19 +86,19 @@ pub async fn run_inhibits(settings: Rc<crate::SessionSettings>) {
     }
 }
 
-async fn reconcile(
+async fn sync_from_session(
     session: &SessionManagerProxy<'_>,
     logind: &LogindProxy<'_>,
     inhibitors: &mut SessionInhibitors,
 ) -> Result<()> {
     let actions = session.inhibited_actions().await?;
-    inhibitors.reconcile(logind, actions).await
+    inhibitors.apply(logind, actions).await
 }
 
 async fn watch_session_inhibits(
     session_bus: &zbus::Connection,
     system_bus: &zbus::Connection,
-    interval: impl Fn() -> Duration,
+    next_poll_delay: impl Fn() -> Duration,
 ) -> Result<()> {
     let logind = LogindProxy::new(system_bus).await?;
     // Caching must stay off: a cached value is kept fresh by change signals,
@@ -111,7 +110,7 @@ async fn watch_session_inhibits(
     // Not the typed proxy's `receive_inhibited_actions_changed`: that stream
     // is fed by the property cache and ends immediately on a cache-free
     // proxy. A raw PropertiesChanged subscription works without a cache and
-    // merely pokes us; `reconcile` below always fetches live state.
+    // merely pokes us; `sync_from_session` below always fetches live state.
     let properties = zbus::fdo::PropertiesProxy::builder(session_bus)
         .destination("org.gnome.SessionManager")?
         .path("/org/gnome/SessionManager")?
@@ -119,11 +118,11 @@ async fn watch_session_inhibits(
         .await?;
     // Subscribe before the initial read so a concurrent change is not lost.
     let mut changes = properties.receive_properties_changed().await?;
-    let mut inhibitors = SessionInhibitors::default();
+    let mut inhibitors = SessionInhibitors::new();
     // Never propagate a failed first reconciliation: it would abort the
     // watcher and drop locks already taken. The loop below keeps retrying
     // on every tick.
-    if let Err(e) = reconcile(&session, &logind, &mut inhibitors).await {
+    if let Err(e) = sync_from_session(&session, &logind, &mut inhibitors).await {
         warn_reconcile_failed(e);
     }
 
@@ -132,20 +131,20 @@ async fn watch_session_inhibits(
     // polled before signals (so its timer is armed promptly) and reset only
     // when it fires, so draining a signal backlog cannot postpone the next
     // deadline — and every drained signal reconciles live state anyway.
-    let mut tick = glib::timeout_future(interval());
+    let mut tick = glib::timeout_future(next_poll_delay());
     loop {
-        let ticked = match future::select(&mut tick, changes.next()).await {
+        let poll_due = match future::select(&mut tick, changes.next()).await {
             future::Either::Left(((), _)) => true,
             // The signal stream only ends when the connection is lost; the
             // caller then reconnects and subscribes afresh.
             future::Either::Right((None, _)) => return Ok(()),
             future::Either::Right((Some(_), _)) => false,
         };
-        if ticked {
+        if poll_due {
             // Schedule the next tick before the slow D-Bus work below.
-            tick = glib::timeout_future(interval());
+            tick = glib::timeout_future(next_poll_delay());
         }
-        if let Err(e) = reconcile(&session, &logind, &mut inhibitors).await {
+        if let Err(e) = sync_from_session(&session, &logind, &mut inhibitors).await {
             // A transient read failure keeps the last known lock state; the
             // next tick retries, including after a GNOME service restart.
             warn_reconcile_failed(e);
@@ -164,6 +163,7 @@ mod tests {
         Arc,
     };
     use zbus::export::futures_util::{future::Either, pin_mut};
+    use zbus::zvariant::OwnedFd;
     use zbus::{dbus_interface, ConnectionBuilder};
 
     struct MockSession(Arc<AtomicU32>);
