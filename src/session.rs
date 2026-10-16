@@ -11,6 +11,13 @@ use zbus::{dbus_proxy, Result};
 
 use crate::logind::{reconcile_lock, LogindProxy};
 
+fn warn_reconcile_failed(e: zbus::Error) {
+    g_log!(
+        glib::LogLevel::Warning,
+        "Failed to reconcile session inhibition: {e}"
+    );
+}
+
 const INHIBIT_IDLE: u32 = 1 << 3;
 const INHIBIT_SUSPEND: u32 = 1 << 2;
 
@@ -110,10 +117,7 @@ async fn watch_session_inhibits(
     // watcher and drop locks already taken. The loop below keeps retrying
     // on every tick.
     if let Err(e) = reconcile(&session, &logind, &mut inhibitors).await {
-        g_log!(
-            glib::LogLevel::Warning,
-            "Failed to reconcile session inhibition: {e}"
-        );
+        warn_reconcile_failed(e);
     }
 
     // Reconcile on property changes and, independently, on a periodic tick,
@@ -137,10 +141,7 @@ async fn watch_session_inhibits(
         if let Err(e) = reconcile(&session, &logind, &mut inhibitors).await {
             // A transient read failure keeps the last known lock state; the
             // next tick retries, including after a GNOME service restart.
-            g_log!(
-                glib::LogLevel::Warning,
-                "Failed to reconcile session inhibition: {e}"
-            );
+            warn_reconcile_failed(e);
         }
     }
 }
@@ -155,6 +156,7 @@ mod tests {
         atomic::{AtomicU32, AtomicUsize, Ordering},
         Arc,
     };
+    use zbus::export::futures_util::{future::Either, pin_mut};
     use zbus::{dbus_interface, ConnectionBuilder};
 
     struct MockSession(Arc<AtomicU32>);
@@ -172,7 +174,7 @@ mod tests {
     #[dbus_interface(name = "org.freedesktop.login1.Manager")]
     impl MockLogind {
         async fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> OwnedFd {
-            assert_eq!(who, "regolith-powerd");
+            assert_eq!(who, crate::logind::WHO);
             assert_eq!(why, "GNOME session inhibition");
             assert_eq!(mode, "block");
             let (lock, observer) = UnixStream::pair().unwrap();
@@ -252,14 +254,13 @@ mod tests {
             // The next poll is still well away: this must be signal-driven.
             let received = calls.recv();
             let deadline = glib::timeout_future(Duration::from_millis(250));
-            zbus::export::futures_util::pin_mut!(received, deadline);
-            let (what, sleep) =
-                match zbus::export::futures_util::future::select(received, deadline).await {
-                    zbus::export::futures_util::future::Either::Left((call, _)) => call.unwrap(),
-                    zbus::export::futures_util::future::Either::Right(_) => {
-                        panic!("property signal was not consumed")
-                    }
-                };
+            pin_mut!(received, deadline);
+            let (what, sleep) = match future::select(received, deadline).await {
+                Either::Left((call, _)) => call.unwrap(),
+                Either::Right(_) => {
+                    panic!("property signal was not consumed")
+                }
+            };
             assert_eq!(what, "sleep");
             await_released(idle).await;
 
@@ -300,12 +301,12 @@ mod tests {
                 "stable state acquired extra locks under signal pressure"
             );
         };
-        zbus::export::futures_util::pin_mut!(watch, sequence);
-        match zbus::export::futures_util::future::select(watch, sequence).await {
-            zbus::export::futures_util::future::Either::Left((result, _)) => {
+        pin_mut!(watch, sequence);
+        match future::select(watch, sequence).await {
+            Either::Left((result, _)) => {
                 panic!("watcher ended early: {result:?}");
             }
-            zbus::export::futures_util::future::Either::Right(_) => {}
+            Either::Right(_) => {}
         }
     }
 
@@ -320,10 +321,8 @@ mod tests {
         glib::MainContext::new().block_on(async {
             let exercise = exercise_bridge();
             let watchdog = glib::timeout_future(Duration::from_secs(20));
-            zbus::export::futures_util::pin_mut!(exercise, watchdog);
-            if let zbus::export::futures_util::future::Either::Right(_) =
-                zbus::export::futures_util::future::select(exercise, watchdog).await
-            {
+            pin_mut!(exercise, watchdog);
+            if let Either::Right(_) = future::select(exercise, watchdog).await {
                 panic!("bridge test timed out");
             }
         });

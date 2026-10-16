@@ -3,6 +3,8 @@
 use zbus::zvariant::OwnedFd;
 use zbus::{dbus_proxy, Result};
 
+pub const WHO: &str = "regolith-powerd";
+
 #[dbus_proxy(
     interface = "org.freedesktop.login1.Manager",
     default_service = "org.freedesktop.login1",
@@ -19,7 +21,7 @@ pub async fn setup_logind_inhibits() -> Result<OwnedFd> {
     proxy
         .Inhibit(
             "handle-power-key:handle-lid-switch",
-            "regolith-powerd",
+            WHO,
             "Power key action handled by regolith-powerd",
             "block",
         )
@@ -42,7 +44,7 @@ pub async fn reconcile_lock(
     } else if lock.is_none() {
         *lock = Some(
             proxy
-                .Inhibit(what, "regolith-powerd", "GNOME session inhibition", "block")
+                .Inhibit(what, WHO, "GNOME session inhibition", "block")
                 .await?,
         );
     }

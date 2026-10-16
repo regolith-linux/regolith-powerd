@@ -294,7 +294,7 @@ fn main() {
             Ok(fd) => {
                 // Intentionally leak the fd: dropping it would release the
                 // inhibitor, and the kernel closes it when the daemon exits.
-                std::mem::forget(fd);
+                let _ = ManuallyDrop::new(fd);
             }
             Err(e) => g_log!(
                 glib::LogLevel::Warning,
