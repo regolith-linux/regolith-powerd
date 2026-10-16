@@ -5,6 +5,7 @@ use std::{
     error::Error,
     mem::ManuallyDrop,
     process::{Child, Command},
+    rc::Rc,
 };
 use swayipc;
 
@@ -13,7 +14,7 @@ mod session;
 
 struct Manager {
     power_settings: PowerSettings,
-    session_settings: SessionSettings,
+    session_settings: Rc<SessionSettings>,
 }
 
 #[gen_settings(
@@ -29,9 +30,9 @@ pub struct PowerSettings;
 pub struct SessionSettings;
 
 impl Manager {
-    pub fn new() -> Self {
+    pub fn new(session_settings: Rc<SessionSettings>) -> Self {
         Self {
-            session_settings: SessionSettings::new(),
+            session_settings,
             power_settings: PowerSettings::new(),
         }
     }
@@ -304,9 +305,10 @@ fn main() {
     });
 
     // Bridge GNOME session inhibition to logind, which swayidle already honors.
-    glib::spawn_future_local(session::run_inhibits());
+    let session_settings = Rc::new(SessionSettings::new());
+    glib::spawn_future_local(session::run_inhibits(session_settings.clone()));
 
-    let manager = Manager::new();
+    let manager = Manager::new(session_settings);
     manager.run().expect("Failed to run");
     app.run();
 

@@ -4,6 +4,7 @@
 //! through GNOME interfaces.
 
 use glib::g_log;
+use std::rc::Rc;
 use std::time::Duration;
 use zbus::export::futures_util::{future, StreamExt};
 use zbus::zvariant::OwnedFd;
@@ -20,6 +21,13 @@ fn warn_reconcile_failed(e: zbus::Error) {
 
 const INHIBIT_IDLE: u32 = 1 << 3;
 const INHIBIT_SUSPEND: u32 = 1 << 2;
+const MAX_POLL_SECS: u32 = 30;
+
+/// Delay between periodic reads that repair missed change signals: half the
+/// idle delay, bounded so a stale lock never outlives `MAX_POLL_SECS`.
+fn poll_interval(idle_delay_secs: u32) -> Duration {
+    Duration::from_secs(u64::from((idle_delay_secs / 2).clamp(1, MAX_POLL_SECS)))
+}
 
 #[dbus_proxy(
     interface = "org.gnome.SessionManager",
@@ -58,14 +66,13 @@ impl SessionInhibitors {
 /// Mirror GNOME's aggregated inhibition state to logind. Swayidle consumes
 /// logind's idle lock through BlockInhibited without needing a restart.
 /// Never returns: connection failures are logged and retried.
-pub async fn run_inhibits() {
-    let settings = crate::SessionSettings::new();
+pub async fn run_inhibits(settings: Rc<crate::SessionSettings>) {
     loop {
         let result: Result<()> = async {
             let session_bus = zbus::Connection::session().await?;
             let system_bus = zbus::Connection::system().await?;
             watch_session_inhibits(&session_bus, &system_bus, || {
-                Duration::from_secs(u64::from((settings.idle_delay() / 2).max(1)))
+                poll_interval(settings.idle_delay())
             })
             .await
         }
@@ -308,6 +315,14 @@ mod tests {
             }
             Either::Right(_) => {}
         }
+    }
+
+    #[test]
+    fn poll_interval_is_half_idle_delay_within_bounds() {
+        assert_eq!(poll_interval(0), Duration::from_secs(1));
+        assert_eq!(poll_interval(60), Duration::from_secs(30));
+        assert_eq!(poll_interval(600), Duration::from_secs(30));
+        assert_eq!(poll_interval(20), Duration::from_secs(10));
     }
 
     #[test]
