@@ -21,6 +21,8 @@ fn warn_reconcile_failed(e: zbus::Error) {
 const INHIBIT_IDLE: u32 = 1 << 3;
 const INHIBIT_SUSPEND: u32 = 1 << 2;
 const MAX_POLL_SECS: u32 = 30;
+const SESSION_MANAGER: &str = "org.gnome.SessionManager";
+const LOGIND: &str = "org.freedesktop.login1";
 
 /// Delay between periodic reads that repair missed change signals: half the
 /// idle delay, bounded so a stale lock never outlives `MAX_POLL_SECS`.
@@ -86,12 +88,26 @@ pub async fn run_inhibits(settings: Rc<crate::SessionSettings>) {
     }
 }
 
+async fn session_manager_gone(bus: &zbus::fdo::DBusProxy<'_>) -> bool {
+    match zbus::names::BusName::try_from(SESSION_MANAGER) {
+        Ok(name) => matches!(bus.name_has_owner(name).await, Ok(false)),
+        Err(_) => false,
+    }
+}
+
 async fn sync_from_session(
     session: &SessionManagerProxy<'_>,
+    session_bus: &zbus::fdo::DBusProxy<'_>,
     logind: &LogindProxy<'_>,
     inhibitors: &mut SessionInhibitors,
 ) -> Result<()> {
-    let actions = session.inhibited_actions().await?;
+    let actions = match session.inhibited_actions().await {
+        Ok(actions) => actions,
+        // Only a confirmed owner loss releases the locks; other read
+        // failures are transient and keep the last known state.
+        Err(_) if session_manager_gone(session_bus).await => 0,
+        Err(e) => return Err(e),
+    };
     inhibitors.apply(logind, actions).await
 }
 
@@ -118,11 +134,19 @@ async fn watch_session_inhibits(
         .await?;
     // Subscribe before the initial read so a concurrent change is not lost.
     let mut changes = properties.receive_properties_changed().await?;
+    let session_dbus = zbus::fdo::DBusProxy::new(session_bus).await?;
+    // This stream only ends when the system-bus connection closes. Logind
+    // acquisitions would then fail forever, so the watcher must return and
+    // let the caller reconnect.
+    let system_dbus = zbus::fdo::DBusProxy::new(system_bus).await?;
+    let mut system_alive = system_dbus
+        .receive_name_owner_changed_with_args(&[(0, LOGIND)])
+        .await?;
     let mut inhibitors = SessionInhibitors::new();
     // Never propagate a failed first reconciliation: it would abort the
     // watcher and drop locks already taken. The loop below keeps retrying
     // on every tick.
-    if let Err(e) = sync_from_session(&session, &logind, &mut inhibitors).await {
+    if let Err(e) = sync_from_session(&session, &session_dbus, &logind, &mut inhibitors).await {
         warn_reconcile_failed(e);
     }
 
@@ -133,18 +157,22 @@ async fn watch_session_inhibits(
     // deadline — and every drained signal reconciles live state anyway.
     let mut tick = glib::timeout_future(next_poll_delay());
     loop {
-        let poll_due = match future::select(&mut tick, changes.next()).await {
-            future::Either::Left(((), _)) => true,
-            // The signal stream only ends when the connection is lost; the
-            // caller then reconnects and subscribes afresh.
+        let event = future::select(&mut tick, changes.next());
+        let poll_due = match future::select(event, system_alive.next()).await {
+            // The system bus closed; the caller reconnects afresh.
             future::Either::Right((None, _)) => return Ok(()),
+            // Logind owner changes carry no state; reconcile below.
             future::Either::Right((Some(_), _)) => false,
+            future::Either::Left((future::Either::Left(((), _)), _)) => true,
+            // The signal stream only ends when the connection is lost.
+            future::Either::Left((future::Either::Right((None, _)), _)) => return Ok(()),
+            future::Either::Left((future::Either::Right((Some(_), _)), _)) => false,
         };
         if poll_due {
             // Schedule the next tick before the slow D-Bus work below.
             tick = glib::timeout_future(next_poll_delay());
         }
-        if let Err(e) = sync_from_session(&session, &logind, &mut inhibitors).await {
+        if let Err(e) = sync_from_session(&session, &session_dbus, &logind, &mut inhibitors).await {
             // A transient read failure keeps the last known lock state; the
             // next tick retries, including after a GNOME service restart.
             warn_reconcile_failed(e);
