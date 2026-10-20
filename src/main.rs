@@ -9,6 +9,7 @@ use std::{
 };
 use swayipc;
 
+mod battery;
 mod logind;
 mod screensaver;
 mod session;
@@ -330,6 +331,11 @@ fn main() {
 
     let manager = Manager::new(session_settings);
     manager.run().expect("Failed to run");
+
+    // Low-battery notifications, which gnome-settings-daemon's power
+    // plugin gives the X11 session.
+    glib::spawn_future_local(battery::run_warnings());
+
     app.run();
 
     // Drop the hold guard
