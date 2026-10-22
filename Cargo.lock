@@ -1041,6 +1041,7 @@ dependencies = [
  "gio",
  "glib",
  "gsettings-macro",
+ "libc",
  "swayipc",
  "zbus",
 ]
