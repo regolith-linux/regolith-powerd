@@ -15,7 +15,7 @@ mod session;
 struct Manager {
     power_settings: PowerSettings,
     session_settings: Rc<SessionSettings>,
-    screensaver_settings: gio::Settings,
+    screensaver_settings: ScreensaverSettings,
 }
 
 #[gen_settings(
@@ -30,10 +30,17 @@ pub struct PowerSettings;
 )]
 pub struct SessionSettings;
 
-const SCREENSAVER_SCHEMA: &str = "org.gnome.desktop.screensaver";
-const LOCK_ENABLED_KEY: &str = "lock-enabled";
-const LOCK_DELAY_KEY: &str = "lock-delay";
+#[gen_settings(
+    file = "org.gnome.desktop.screensaver.gschema.xml",
+    id = "org.gnome.desktop.screensaver"
+)]
+pub struct ScreensaverSettings;
+
 // Added by Ubuntu's gsettings-desktop-schemas; upstream GNOME has no such key.
+// It is left out of the schema file above on purpose: gen_settings generates
+// accessors from that file at build time, but they read the schema installed
+// at run time, and GSettings aborts on a key that schema lacks. So this key is
+// read through the underlying gio::Settings after checking it exists.
 const LOCK_ON_SUSPEND_KEY: &str = "ubuntu-lock-on-suspend";
 
 impl Manager {
@@ -41,7 +48,7 @@ impl Manager {
         Self {
             session_settings,
             power_settings: PowerSettings::new(),
-            screensaver_settings: gio::Settings::new(SCREENSAVER_SCHEMA),
+            screensaver_settings: ScreensaverSettings::new(),
         }
     }
     pub fn run(self) -> Result<(), Box<dyn Error>> {
@@ -77,13 +84,21 @@ impl Manager {
                 s.handle_power_btn_action_change()
                     .expect("Failed to set Power button action")
             });
-        for key in [LOCK_ENABLED_KEY, LOCK_DELAY_KEY, LOCK_ON_SUSPEND_KEY] {
+        let send_screensaver_reload_cb = || {
             let tx_cpy = send_reload_event.clone();
-            self.screensaver_settings
-                .connect_changed(Some(key), move |_, _| {
-                    tx_cpy.send_blocking(()).expect("Cannot reload config");
-                });
-        }
+            return move |_: &ScreensaverSettings| {
+                tx_cpy.send_blocking(()).expect("Cannot reload config");
+            };
+        };
+        self.screensaver_settings
+            .connect_lock_enabled_changed(send_screensaver_reload_cb());
+        self.screensaver_settings
+            .connect_lock_delay_changed(send_screensaver_reload_cb());
+        let tx_cpy = send_reload_event.clone();
+        self.screensaver_settings
+            .connect_changed(Some(LOCK_ON_SUSPEND_KEY), move |_, _| {
+                tx_cpy.send_blocking(()).expect("Cannot reload config");
+            });
         self.session_settings.connect_idle_delay_changed(move |_| {
             send_reload_event
                 .clone()
@@ -156,8 +171,8 @@ impl Manager {
             args.append(&mut swayidle_display_off_resume_args);
 
             // Locked lock-delay seconds after display off
-            if self.screensaver_settings.boolean(LOCK_ENABLED_KEY) {
-                let lock_delay_sec = self.screensaver_settings.uint(LOCK_DELAY_KEY);
+            if self.screensaver_settings.lock_enabled() {
+                let lock_delay_sec = self.screensaver_settings.lock_delay();
                 let lock_timeout_sec = display_off_timeout_sec.saturating_add(lock_delay_sec);
                 let mut swayidle_lock_timeout_args =
                     Self::get_timeout_cmd(lock_timeout_sec, &lock_screen);

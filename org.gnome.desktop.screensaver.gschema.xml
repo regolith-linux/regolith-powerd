@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="gsettings-desktop-schemas">
+  <schema id="org.gnome.desktop.screensaver" path="/org/gnome/desktop/screensaver/">
+    <key name="lock-enabled" type="b">
+      <default>true</default>
+      <summary>Lock on activation</summary>
+      <description>Set this to TRUE to lock the screen when the screensaver goes active.</description>
+    </key>
+    <key name="lock-delay" type="u">
+      <default>0</default>
+      <summary>Time before locking</summary>
+      <description>The number of seconds after screensaver activation before locking the screen.</description>
+    </key>
+
+  </schema>
+
+</schemalist>
