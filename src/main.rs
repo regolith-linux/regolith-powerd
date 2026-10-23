@@ -15,6 +15,7 @@ mod session;
 struct Manager {
     power_settings: PowerSettings,
     session_settings: Rc<SessionSettings>,
+    screensaver_settings: ScreensaverSettings,
 }
 
 #[gen_settings(
@@ -29,11 +30,25 @@ pub struct PowerSettings;
 )]
 pub struct SessionSettings;
 
+#[gen_settings(
+    file = "org.gnome.desktop.screensaver.gschema.xml",
+    id = "org.gnome.desktop.screensaver"
+)]
+pub struct ScreensaverSettings;
+
+// Added by Ubuntu's gsettings-desktop-schemas; upstream GNOME has no such key.
+// It is left out of the schema file above on purpose: gen_settings generates
+// accessors from that file at build time, but they read the schema installed
+// at run time, and GSettings aborts on a key that schema lacks. So this key is
+// read through the underlying gio::Settings after checking it exists.
+const LOCK_ON_SUSPEND_KEY: &str = "ubuntu-lock-on-suspend";
+
 impl Manager {
     pub fn new(session_settings: Rc<SessionSettings>) -> Self {
         Self {
             session_settings,
             power_settings: PowerSettings::new(),
+            screensaver_settings: ScreensaverSettings::new(),
         }
     }
     pub fn run(self) -> Result<(), Box<dyn Error>> {
@@ -68,6 +83,21 @@ impl Manager {
             .connect_power_button_action_changed(|s| {
                 s.handle_power_btn_action_change()
                     .expect("Failed to set Power button action")
+            });
+        let send_screensaver_reload_cb = || {
+            let tx_cpy = send_reload_event.clone();
+            return move |_: &ScreensaverSettings| {
+                tx_cpy.send_blocking(()).expect("Cannot reload config");
+            };
+        };
+        self.screensaver_settings
+            .connect_lock_enabled_changed(send_screensaver_reload_cb());
+        self.screensaver_settings
+            .connect_lock_delay_changed(send_screensaver_reload_cb());
+        let tx_cpy = send_reload_event.clone();
+        self.screensaver_settings
+            .connect_changed(Some(LOCK_ON_SUSPEND_KEY), move |_, _| {
+                tx_cpy.send_blocking(()).expect("Cannot reload config");
             });
         self.session_settings.connect_idle_delay_changed(move |_| {
             send_reload_event
@@ -107,7 +137,10 @@ impl Manager {
         );
         let lock_screen = format!("$(trawlcat wm.program.lock_sway \"{default_lock}\")");
 
-        if self.power_settings.idle_dim() {
+        // An idle delay of 0 means the session never becomes idle
+        let idle_delay_sec = self.session_settings.idle_delay();
+
+        if idle_delay_sec > 0 && self.power_settings.idle_dim() {
             let idle_brightness = self.power_settings.idle_brightness();
             let action = format!(
                 r#"
@@ -120,27 +153,31 @@ impl Manager {
             );
 
             // Dim screen to $idle_brightness when idle dim timeout hit
-            let dim_timeout_sec = self.session_settings.idle_delay();
-            let mut swayidle_dim_timeout_args = Self::get_timeout_cmd(dim_timeout_sec, &action);
+            let mut swayidle_dim_timeout_args = Self::get_timeout_cmd(idle_delay_sec, &action);
             let mut swayidle_dim_resume_args = Self::get_resume_cmd(&format!(
                 "light -S $(cat $XDG_RUNTIME_DIR/screen_brightness_old.var)"
             ));
             args.append(&mut swayidle_dim_timeout_args);
             args.append(&mut swayidle_dim_resume_args);
+        }
 
-            // Display off at 5 seconds after dim timeout
-            let display_off_timeout_sec = dim_timeout_sec + 5;
+        if idle_delay_sec > 0 {
+            // Display off at 5 seconds after idle timeout, whether or not the screen dims
+            let display_off_timeout_sec = idle_delay_sec.saturating_add(5);
             let mut swayidle_display_off_timeout_args =
                 Self::get_timeout_cmd(display_off_timeout_sec, &display_off);
             let mut swayidle_display_off_resume_args = Self::get_resume_cmd(&display_on);
             args.append(&mut swayidle_display_off_timeout_args);
             args.append(&mut swayidle_display_off_resume_args);
 
-            // Locked 10 seconds after dim timeout / 5 seconds after display off
-            let lock_timeout_sec = display_off_timeout_sec + 5;
-            let mut swayidle_lock_timeout_args =
-                Self::get_timeout_cmd(lock_timeout_sec, &lock_screen);
-            args.append(&mut swayidle_lock_timeout_args);
+            // Locked lock-delay seconds after display off
+            if self.screensaver_settings.lock_enabled() {
+                let lock_delay_sec = self.screensaver_settings.lock_delay();
+                let lock_timeout_sec = display_off_timeout_sec.saturating_add(lock_delay_sec);
+                let mut swayidle_lock_timeout_args =
+                    Self::get_timeout_cmd(lock_timeout_sec, &lock_screen);
+                args.append(&mut swayidle_lock_timeout_args);
+            }
         }
 
         let (idle_action_ac_opt, resume_action_ac_opt) = {
@@ -154,7 +191,8 @@ impl Manager {
                 ),
                 Shutdown => (Some("poweroff"), None),
                 Logout => (Some("gnome-session-quit --no-prompt"), None),
-                Interactive => todo!("Show some gui prompt to the user"),
+                // TODO: Show some gui prompt to the user; until then, do nothing
+                Interactive => (None, None),
                 _ => (None, None),
             }
         };
@@ -169,15 +207,17 @@ impl Manager {
                 ),
                 Shutdown => (Some("poweroff"), None),
                 Logout => (Some("gnome-session-quit --no-prompt"), None),
-                Interactive => todo!("Show some gui prompt to the user"),
+                // TODO: Show some gui prompt to the user; until then, do nothing
+                Interactive => (None, None),
                 _ => (None, None),
             }
         };
 
-        if let Some(action) = idle_action_ac_opt {
-            let timeout = self.power_settings.sleep_inactive_ac_timeout();
+        // A sleep-inactive timeout of 0 means never
+        let ac_timeout = self.power_settings.sleep_inactive_ac_timeout();
+        if let Some(action) = idle_action_ac_opt.filter(|_| ac_timeout > 0) {
             let on_timout = Self::get_power_source_cmd(PowerSource::Ac, action);
-            let mut swayidle_timeout_args = Self::get_timeout_cmd(timeout as u32, &on_timout);
+            let mut swayidle_timeout_args = Self::get_timeout_cmd(ac_timeout as u32, &on_timout);
             args.append(&mut swayidle_timeout_args);
 
             if let Some(resume_action) = resume_action_ac_opt {
@@ -186,10 +226,10 @@ impl Manager {
             }
         }
 
-        if let Some(action) = idle_action_bat_opt {
-            let timeout = self.power_settings.sleep_inactive_battery_timeout();
+        let bat_timeout = self.power_settings.sleep_inactive_battery_timeout();
+        if let Some(action) = idle_action_bat_opt.filter(|_| bat_timeout > 0) {
             let on_timout = Self::get_power_source_cmd(PowerSource::Battery, action);
-            let mut swayidle_timout_args = Self::get_timeout_cmd(timeout as u32, &on_timout);
+            let mut swayidle_timout_args = Self::get_timeout_cmd(bat_timeout as u32, &on_timout);
             args.append(&mut swayidle_timout_args);
 
             if let Some(resume_action) = resume_action_bat_opt {
@@ -199,7 +239,11 @@ impl Manager {
         }
 
         let pause_audio = format!("playerctl -a pause");
-        let before_sleep = format!("{display_off};{lock_screen};{pause_audio};sleep 1");
+        let before_sleep = if self.lock_on_suspend() {
+            format!("{display_off};{lock_screen};{pause_audio};sleep 1")
+        } else {
+            format!("{display_off};{pause_audio};sleep 1")
+        };
         let after_resume = display_on.clone();
         let mut before_sleep_args = vec!["before-sleep".to_owned(), before_sleep];
         let mut after_resum_args = vec!["after-resume".to_owned(), after_resume];
@@ -208,6 +252,16 @@ impl Manager {
         args.append(&mut after_resum_args);
         args.append(&mut lock_screen_args);
         args
+    }
+
+    /// Whether to lock the screen before the system sleeps. Keeps locking
+    /// when the installed screensaver schema lacks the Ubuntu key.
+    fn lock_on_suspend(&self) -> bool {
+        let has_key = self
+            .screensaver_settings
+            .settings_schema()
+            .is_some_and(|schema| schema.has_key(LOCK_ON_SUSPEND_KEY));
+        !has_key || self.screensaver_settings.boolean(LOCK_ON_SUSPEND_KEY)
     }
 
     fn get_timeout_cmd(timeout: u32, action: &str) -> Vec<String> {
