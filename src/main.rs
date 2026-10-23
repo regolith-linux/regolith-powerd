@@ -5,14 +5,16 @@ use std::{
     error::Error,
     mem::ManuallyDrop,
     process::{Child, Command},
+    rc::Rc,
 };
 use swayipc;
 
 mod logind;
+mod session;
 
 struct Manager {
     power_settings: PowerSettings,
-    session_settings: SessionSettings,
+    session_settings: Rc<SessionSettings>,
 }
 
 #[gen_settings(
@@ -28,9 +30,9 @@ pub struct PowerSettings;
 pub struct SessionSettings;
 
 impl Manager {
-    pub fn new() -> Self {
+    pub fn new(session_settings: Rc<SessionSettings>) -> Self {
         Self {
-            session_settings: SessionSettings::new(),
+            session_settings,
             power_settings: PowerSettings::new(),
         }
     }
@@ -298,13 +300,30 @@ impl PowerSettings {
 fn main() {
     let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
 
-    // Setup holds for event loop and logind inhibit
-    let hold = (app.hold(), logind::setup_logind_inhibits());
+    // Keep the application alive until the end of the program
+    let hold_guard = ManuallyDrop::new(app.hold());
 
-    // Keep the hold guard alive until the end of the program
-    let hold_guard = ManuallyDrop::new(hold);
+    // Take over power-key and lid-switch handling from logind for the
+    // daemon's lifetime, once the session main context starts running.
+    glib::spawn_future_local(async {
+        match logind::setup_logind_inhibits().await {
+            Ok(fd) => {
+                // Intentionally leak the fd: dropping it would release the
+                // inhibitor, and the kernel closes it when the daemon exits.
+                let _ = ManuallyDrop::new(fd);
+            }
+            Err(e) => g_log!(
+                glib::LogLevel::Warning,
+                "Failed to acquire logind inhibitors: {e}"
+            ),
+        }
+    });
 
-    let manager = Manager::new();
+    // Bridge GNOME session inhibition to logind, which swayidle already honors.
+    let session_settings = Rc::new(SessionSettings::new());
+    glib::spawn_future_local(session::run_inhibits(session_settings.clone()));
+
+    let manager = Manager::new(session_settings);
     manager.run().expect("Failed to run");
     app.run();
 
