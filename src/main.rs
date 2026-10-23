@@ -10,6 +10,7 @@ use std::{
 use swayipc;
 
 mod logind;
+mod screensaver;
 mod session;
 
 struct Manager {
@@ -298,6 +299,10 @@ impl PowerSettings {
     }
 }
 fn main() {
+    // The lock screen's D-Bus interface, which gnome-flashback provides in
+    // the X11 session. It runs in a thread of its own.
+    screensaver::start();
+
     let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
 
     // Keep the application alive until the end of the program
