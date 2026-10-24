@@ -9,7 +9,9 @@ use std::{
 };
 use swayipc;
 
+mod end_session;
 mod logind;
+mod monitor_labels;
 mod screensaver;
 mod session;
 
@@ -327,6 +329,12 @@ fn main() {
     // Bridge GNOME session inhibition to logind, which swayidle already honors.
     let session_settings = Rc::new(SessionSettings::new());
     glib::spawn_future_local(session::run_inhibits(session_settings.clone()));
+
+    // The confirmation that gnome-session asks the shell for before ending
+    // the session, which gnome-flashback provides in the X11 session, and the
+    // Displays panel's monitor labels, which are asked for under the same
+    // name. They run in a thread of their own.
+    end_session::start();
 
     let manager = Manager::new(session_settings);
     manager.run().expect("Failed to run");
