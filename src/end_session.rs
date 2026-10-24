@@ -12,9 +12,10 @@
 //! and the next end-session request carried out the stalled one instead of
 //! its own.
 //!
-//! This module owns `org.gnome.Shell` only to receive those calls; it serves
-//! nothing else under that name. It asks with a swaynag bar, the same kind of
-//! prompt that the session's logout, reboot and shutdown keybindings show:
+//! This module owns `org.gnome.Shell` to receive those calls. The only other
+//! thing served under that name is the Displays panel's monitor labels (see
+//! `monitor_labels`). It asks with a swaynag bar, the same kind of prompt
+//! that the session's logout, reboot and shutdown keybindings show:
 //!
 //! - the button confirms, and closing the bar cancels;
 //! - when nothing inhibits logging out, the action is taken once the time
@@ -29,6 +30,7 @@
 //!   something inhibits logging out, the bar is shown anyway, as gnome-session
 //!   would do for a logout.
 
+use crate::monitor_labels;
 use gio::prelude::*;
 use glib::g_log;
 use std::fs;
@@ -543,12 +545,20 @@ pub fn serve(session: &Connection, config: Config) -> zbus::Result<()> {
     Ok(())
 }
 
-/// Provide the end-session dialog on the user's session bus for the lifetime
-/// of the daemon, from a thread of its own.
+/// Provide the end-session dialog, and the monitor labels that are asked for
+/// under the same name, on the user's session bus for the lifetime of the
+/// daemon, from a thread of its own.
 pub fn start() {
     thread::spawn(|| {
-        let result = zbus::block_on(Connection::session())
-            .and_then(|session| serve(&session, Config::default()));
+        let result = zbus::block_on(Connection::session()).and_then(|session| {
+            if let Err(e) = monitor_labels::serve(&session) {
+                g_log!(
+                    glib::LogLevel::Warning,
+                    "The monitor labels are unavailable: {e}"
+                );
+            }
+            serve(&session, Config::default())
+        });
         if let Err(e) = result {
             g_log!(
                 glib::LogLevel::Warning,
@@ -559,7 +569,7 @@ pub fn start() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::unix::fs::PermissionsExt;
@@ -661,7 +671,7 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    struct Bus(Child);
+    pub(crate) struct Bus(Child);
 
     impl Drop for Bus {
         fn drop(&mut self) {
@@ -670,7 +680,7 @@ mod tests {
         }
     }
 
-    fn private_bus() -> (Bus, String) {
+    pub(crate) fn private_bus() -> (Bus, String) {
         let mut child = Command::new("dbus-daemon")
             .args(["--session", "--nofork", "--print-address=1"])
             .stdout(Stdio::piped())
@@ -703,7 +713,7 @@ mod tests {
         }
     }
 
-    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    pub(crate) fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
