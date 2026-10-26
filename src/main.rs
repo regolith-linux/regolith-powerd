@@ -15,6 +15,11 @@ mod logind;
 mod screensaver;
 mod session;
 
+// Removable-media automount and its passphrase prompts.
+mod automount;
+mod prompter;
+mod secret_exchange;
+
 struct Manager {
     power_settings: PowerSettings,
     session_settings: Rc<SessionSettings>,
@@ -421,6 +426,10 @@ fn main() {
 
     // Keep the application alive until the end of the program
     let hold_guard = ManuallyDrop::new(app.hold());
+
+    // Removable-media automount, which gnome-flashback provides in the X11
+    // session.
+    let _automount = automount::start();
 
     // Take over power-key and lid-switch handling from logind for the
     // daemon's lifetime, once the session main context starts running.
