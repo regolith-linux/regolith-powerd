@@ -252,50 +252,54 @@ enum PowerSource {
     Battery,
 }
 
-#[derive(Debug)]
-enum KeySymAction {
-    Unbind { key: String },
-    ReBind { key: String, action: String },
+const POWER_OFF_KEY: &str = "XF86Poweroff";
+
+/// Command the power button runs for the GNOME setting `power-button-action`,
+/// or `None` when the button does nothing.
+///
+/// "Power Off" in Settings (`interactive`) asks gnome-session to power off,
+/// which shows the end-session dialog from `end_session`: the same question,
+/// 60-second countdown and list of busy apps as the X11 session's dialog.
+fn power_button_command(action: PowerButtonAction) -> Option<&'static str> {
+    use PowerButtonAction::*;
+    match action {
+        Nothing => None,
+        Suspend => Some("systemctl suspend"),
+        Hibernate => Some("systemctl hibernate"),
+        Interactive => Some("/usr/bin/gnome-session-quit --power-off"),
+    }
 }
 
-const POWER_OFF_KEY: &str = "XF86Poweroff";
+#[cfg(test)]
+mod power_button_tests {
+    use super::{power_button_command, PowerButtonAction};
+
+    #[test]
+    fn power_button_asks_through_the_end_session_dialog() {
+        assert_eq!(
+            power_button_command(PowerButtonAction::Interactive),
+            Some("/usr/bin/gnome-session-quit --power-off")
+        );
+        assert_eq!(
+            power_button_command(PowerButtonAction::Suspend),
+            Some("systemctl suspend")
+        );
+        assert_eq!(
+            power_button_command(PowerButtonAction::Hibernate),
+            Some("systemctl hibernate")
+        );
+        assert_eq!(power_button_command(PowerButtonAction::Nothing), None);
+    }
+}
 
 impl PowerSettings {
     // Requires settings HandlePowerKey=ignore in logind.conf
     fn handle_power_btn_action_change(&self) -> Result<(), Box<dyn Error>> {
-        use PowerButtonAction::*;
         let mut sway_conn = swayipc::Connection::new()?;
-        use KeySymAction::*;
-        let btn_change_action = match self.power_button_action() {
-            Nothing => Unbind {
-                key: POWER_OFF_KEY.to_string(),
-            },
-            Suspend => ReBind {
-                key: POWER_OFF_KEY.to_string(),
-                action: "systemctl suspend".to_string(),
-            },
-            Hibernate => ReBind {
-                key: POWER_OFF_KEY.to_string(),
-                action: "systemctl hibernate".to_string(),
-            },
-            Interactive => ReBind {
-                key: POWER_OFF_KEY.to_string(),
-                // TODO: Replace with a more sensible action (Prefferably user defined)
-                action: "swaynag -t warning -m 'Do you really want to shutdown' -b 'Shutdown' '/usr/bin/gnome-session-quit --power-off --no-prompt'".to_string()
-            }
-        };
-
-        match btn_change_action {
-            Unbind { ref key } => sway_conn.run_command(format!("unbindsym {key}"))?,
-            ReBind {
-                ref key,
-                ref action,
-            } => {
-                let _ = sway_conn.run_command(format!("unbindsym {key}"));
-                sway_conn.run_command(format!("bindsym {key} exec \"{action}\""))?
-            }
-        };
-
+        let _ = sway_conn.run_command(format!("unbindsym {POWER_OFF_KEY}"));
+        if let Some(action) = power_button_command(self.power_button_action()) {
+            sway_conn.run_command(format!("bindsym {POWER_OFF_KEY} exec \"{action}\""))?;
+        }
         Ok(())
     }
 }
