@@ -6,6 +6,7 @@ use std::{
     mem::ManuallyDrop,
     process::{Child, Command},
     rc::Rc,
+    time::Duration,
 };
 use swayipc;
 
@@ -81,10 +82,8 @@ impl Manager {
         let mut sway_idle_child: Option<Child> = None;
         glib::spawn_future_local(async move {
             while let Ok(_) = recv_reload_event.recv().await {
-                if let Some(prev_child) = sway_idle_child.as_mut() {
-                    prev_child
-                        .kill()
-                        .unwrap_or_else(|e| println!("Cannot kill swayidle: {e}"));
+                if let Some(mut prev_child) = sway_idle_child.take() {
+                    stop_swayidle(&mut prev_child).await;
                 }
                 let swayidle_args = self.get_swayidle_args();
                 let child = Command::new("swayidle")
@@ -107,7 +106,10 @@ impl Manager {
         let default_lock = format!(
             "gtklock -d --background $(trawlcat regolith.lockscreen.wallpaper.file /dev/null)"
         );
-        let lock_screen = format!("$(trawlcat wm.program.lock_sway \"{default_lock}\")");
+        let lock_screen = Self::get_lock_cmd(
+            &format!("$(trawlcat wm.program.lock_sway \"{default_lock}\")"),
+            LOCK_WAIT,
+        );
 
         if self.power_settings.idle_dim() {
             let idle_brightness = self.power_settings.idle_brightness();
@@ -244,6 +246,63 @@ impl Manager {
             "#
         )
     }
+
+    /// Shell command that starts `locker` and waits until it exits, but for
+    /// at most `wait` (checked every 100 milliseconds).
+    ///
+    /// swayidle runs with `-w`, so it waits for every command before it
+    /// handles anything else. `gtklock -d` exits as soon as the session is
+    /// locked, but a locker that does not daemonize (plain `gtklock`, or
+    /// `swaylock` without `-f`, set through `wm.program.lock_sway`) keeps
+    /// running until the user unlocks. Waiting for it would stall swayidle
+    /// for the whole time the session is locked: the resume and after-resume
+    /// commands would not run, so the screen would stay off and dimmed behind
+    /// the lock screen.
+    ///
+    /// The command is a single line, so it can be joined with other commands
+    /// by `;`, as in the before-sleep command.
+    fn get_lock_cmd(locker: &str, wait: Duration) -> String {
+        let checks = (wait.as_millis() + 99) / 100;
+        format!(
+            "{locker} & lock_pid=$!; i=0; \
+             while [ $i -lt {checks} ] && kill -0 $lock_pid 2>/dev/null; do \
+             sleep 0.1; i=$((i + 1)); done"
+        )
+    }
+}
+
+/// How long a lock command may take before swayidle carries on (the same
+/// limit as regolith-sway-clamshell's lock before sleep).
+const LOCK_WAIT: Duration = Duration::from_millis(5000);
+
+/// Stop a swayidle started by [`Manager::run`] and reap it.
+///
+/// On SIGTERM swayidle runs the resume command of every timeout that has
+/// fired, which restores the brightness and turns the outputs back on, and
+/// then exits. SIGKILL skips that: a reload while the screen was dimmed or
+/// off left it that way, and the next dim then saved the dimmed brightness
+/// as the one to restore. If swayidle has not exited after 5 seconds it is
+/// killed.
+async fn stop_swayidle(child: &mut Child) {
+    // SAFETY: kill(2) has no memory-safety requirements. The child has not
+    // been reaped yet, so its pid cannot have been reused.
+    if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } != 0 {
+        println!("Cannot stop swayidle: {}", std::io::Error::last_os_error());
+    }
+    for _ in 0..50 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => glib::timeout_future(std::time::Duration::from_millis(100)).await,
+            Err(e) => {
+                println!("Cannot wait for swayidle: {e}");
+                break;
+            }
+        }
+    }
+    child
+        .kill()
+        .unwrap_or_else(|e| println!("Cannot kill swayidle: {e}"));
+    let _ = child.wait();
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -344,8 +403,131 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Manager, PowerSource};
-    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
+    use super::{stop_swayidle, Manager, PowerSource};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        process::Command,
+        time::{Duration, Instant},
+    };
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "regolith-powerd-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Run the lock command for `locker` and report how long it took and
+    /// whether the locker was still running when it returned.
+    fn run_lock_cmd(locker: &str, wait: Duration) -> (Duration, bool) {
+        let dir = test_dir(&format!("lock-{}", wait.as_millis()));
+        let pid_file = dir.join("pid");
+        let cmd = Manager::get_lock_cmd(
+            &format!("sh -c 'echo $$ > {}; exec {locker}'", pid_file.display()),
+            wait,
+        );
+        let start = Instant::now();
+        let status = Command::new("sh").arg("-c").arg(&cmd).status().unwrap();
+        let elapsed = start.elapsed();
+        assert!(status.success());
+        let pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        let running = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        let _ = Command::new("kill")
+            .arg(&pid)
+            .stderr(std::process::Stdio::null())
+            .status();
+        fs::remove_dir_all(&dir).unwrap();
+        (elapsed, running)
+    }
+
+    #[test]
+    fn lock_cmd_can_be_joined_with_other_commands() {
+        let lock = Manager::get_lock_cmd("true", Duration::from_millis(5000));
+        assert!(!lock.contains('\n'));
+        let joined = format!("true;{lock};true");
+        let status = Command::new("sh")
+            .args(["-n", "-c", &joined])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{joined}");
+    }
+
+    #[test]
+    fn lock_cmd_returns_when_the_locker_daemonizes() {
+        let (elapsed, running) = run_lock_cmd("sleep 0.3", Duration::from_millis(5000));
+        assert!(!running);
+        assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    #[test]
+    fn lock_cmd_does_not_wait_for_a_locker_that_keeps_running() {
+        let (elapsed, running) = run_lock_cmd("sleep 30", Duration::from_millis(1000));
+        assert!(running);
+        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// A stand-in for swayidle that, like swayidle, runs its pending resume
+    /// command when it gets SIGTERM.
+    fn fake_swayidle(dir: &PathBuf, on_term: &str) -> std::process::Child {
+        let script = dir.join("swayidle");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ntrap '{on_term}' TERM\necho started > started\nwhile :; do sleep 0.05; done\n"),
+        )
+        .unwrap();
+        // Run it through sh rather than executing the file just written: a
+        // fork in another test thread can still hold it open for writing,
+        // and exec would then fail with ETXTBSY.
+        let child = Command::new("sh")
+            .arg(&script)
+            .current_dir(dir)
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        while !dir.join("started").exists() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child
+    }
+
+    #[test]
+    fn stop_swayidle_lets_it_run_its_resume_commands() {
+        let dir = test_dir("stop-term");
+        let mut child = fake_swayidle(&dir, "echo resumed > resumed; exit 0");
+        glib::MainContext::new().block_on(stop_swayidle(&mut child));
+        assert_eq!(
+            fs::read_to_string(dir.join("resumed")).unwrap().trim(),
+            "resumed"
+        );
+        // Reaped: no zombie is left behind.
+        assert!(child.try_wait().unwrap().is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_swayidle_kills_it_when_it_does_not_exit() {
+        let dir = test_dir("stop-kill");
+        let mut child = fake_swayidle(&dir, "echo ignored > ignored");
+        let start = Instant::now();
+        glib::MainContext::new().block_on(stop_swayidle(&mut child));
+        assert!(start.elapsed() < Duration::from_secs(8));
+        assert!(dir.join("ignored").exists());
+        assert!(child.try_wait().unwrap().is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Run the generated command with a stub `on_ac_power` that exits with
     /// `exit_code`, and report whether the guarded action ran.
