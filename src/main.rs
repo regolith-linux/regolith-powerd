@@ -147,13 +147,7 @@ impl Manager {
         let display_off = DISPLAY_OFF.to_owned();
         let display_on = DISPLAY_ON.to_owned();
 
-        let default_lock = format!(
-            "gtklock -d --background $(trawlcat regolith.lockscreen.wallpaper.file /dev/null)"
-        );
-        let lock_screen = Self::get_lock_cmd(
-            &format!("$(trawlcat wm.program.lock_sway \"{default_lock}\")"),
-            LOCK_WAIT,
-        );
+        let lock_screen = Self::get_lock_cmd(LOCKER, LOCK_WAIT);
 
         // An idle delay of 0 means the session never becomes idle
         let idle_delay_sec = self.session_settings.idle_delay();
@@ -469,6 +463,32 @@ mod lock_trigger_tests {
     }
 }
 
+/// Shell command that starts the lock screen: `wm.program.lock_sway` when it
+/// is set, else `gtklock -d` showing the lock-screen wallpaper
+/// (`regolith.lockscreen.wallpaper.file`).
+///
+/// The wallpaper path goes to gtklock as a single argument, so it may contain
+/// spaces, and a leading `~` is expanded to the home directory. When the
+/// resource is unset or the file doesn't exist, gtklock still starts, just
+/// without the image. (A path with a space used to reach gtklock as several
+/// arguments, and gtklock then crashed, leaving the session unlocked.) These
+/// are the rules of `regolith-sway-gtklock` (from regolith-wm-config's
+/// regolith-sway-gtklock package), which the lock key and the lid close
+/// script use; powerd doesn't depend on that package, so it doesn't call it.
+///
+/// The group runs in the background in [`Manager::get_lock_cmd`], and each
+/// branch `exec`s the locker, so the pid that is waited for is the locker's.
+/// It is a single line, so it can be joined with other commands by `;`.
+const LOCKER: &str = concat!(
+    "{ locker=$(trawlcat wm.program.lock_sway ''); ",
+    "if [ -n \"$locker\" ]; then exec $locker; fi; ",
+    "wallpaper=$(trawlcat regolith.lockscreen.wallpaper.file ''); ",
+    "case $wallpaper in '~/'*) wallpaper=$HOME/${wallpaper#'~/'};; esac; ",
+    "if [ -n \"$wallpaper\" ] && [ -f \"$wallpaper\" ]; then ",
+    "exec gtklock -d --background \"$wallpaper\"; fi; ",
+    "exec gtklock -d; }"
+);
+
 /// Stop a swayidle started by [`Manager::run`] and reap it.
 ///
 /// On SIGTERM swayidle runs the resume command of every timeout that has
@@ -698,7 +718,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{stop_swayidle, Manager, PowerSource};
+    use super::{stop_swayidle, Manager, PowerSource, LOCKER};
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -860,5 +880,117 @@ mod tests {
         assert!(!action_runs(PowerSource::Battery, 0));
         assert!(action_runs(PowerSource::Battery, 1));
         assert!(!action_runs(PowerSource::Battery, 255));
+    }
+
+    /// Run the lock command with stand-ins for trawlcat (answering from
+    /// `resources`, "key: value" lines) and gtklock, and return the arguments
+    /// gtklock got, or None if it didn't start.
+    fn locker_args(resources: &[&str]) -> Option<Vec<String>> {
+        static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = test_dir(&format!("locker-{run}"));
+        let bin = dir.join("bin");
+        let home = dir.join("home");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("lock.png"), "").unwrap();
+        fs::create_dir_all(dir.join("my pictures")).unwrap();
+        fs::write(dir.join("my pictures/lock screen.png"), "").unwrap();
+        let resources: Vec<String> = resources
+            .iter()
+            .map(|r| r.replace("@DIR@", &dir.display().to_string()))
+            .collect();
+        fs::write(dir.join("resources"), resources.join("\n") + "\n").unwrap();
+        fs::write(
+            bin.join("trawlcat"),
+            "#!/bin/sh\n\
+             value=$(sed -n \"s/^$1:[[:space:]]*//p\" \"$STUB_RESOURCES\" | tail -n 1)\n\
+             if [ -n \"$value\" ]; then printf '%s\\n' \"$value\"; else printf '%s\\n' \"$2\"; fi\n",
+        )
+        .unwrap();
+        for locker in ["gtklock", "swaylock"] {
+            fs::write(
+                bin.join(locker),
+                format!(
+                    "#!/bin/sh\necho {locker} > \"$STUB_LOG\"\n\
+                     for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done >> \"$STUB_LOG\"\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(bin.join(locker), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::set_permissions(bin.join("trawlcat"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cmd = Manager::get_lock_cmd(LOCKER, Duration::from_millis(5000));
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", &home)
+            .env("STUB_RESOURCES", dir.join("resources"))
+            .env("STUB_LOG", dir.join("log"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let args = fs::read_to_string(dir.join("log")).ok().map(|log| {
+            log.lines()
+                .map(|l| l.replace(&dir.display().to_string(), "@DIR@"))
+                .collect()
+        });
+        fs::remove_dir_all(&dir).unwrap();
+        args
+    }
+
+    #[test]
+    fn locker_passes_a_wallpaper_path_with_spaces_as_one_argument() {
+        let args =
+            locker_args(&["regolith.lockscreen.wallpaper.file: @DIR@/my pictures/lock screen.png"]);
+        assert_eq!(
+            args.unwrap(),
+            [
+                "gtklock",
+                "-d",
+                "--background",
+                "@DIR@/my pictures/lock screen.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn locker_expands_a_wallpaper_path_under_home() {
+        let args = locker_args(&["regolith.lockscreen.wallpaper.file: ~/lock.png"]);
+        assert_eq!(
+            args.unwrap(),
+            ["gtklock", "-d", "--background", "@DIR@/home/lock.png"]
+        );
+    }
+
+    #[test]
+    fn locker_locks_without_an_image_when_the_wallpaper_is_missing_or_unset() {
+        let missing = locker_args(&["regolith.lockscreen.wallpaper.file: /nonexistent/lock.png"]);
+        assert_eq!(missing.unwrap(), ["gtklock", "-d"]);
+        let unset = locker_args(&[]);
+        assert_eq!(unset.unwrap(), ["gtklock", "-d"]);
+    }
+
+    #[test]
+    fn locker_runs_wm_program_lock_sway_when_it_is_set() {
+        let args = locker_args(&[
+            "wm.program.lock_sway: swaylock -f -c 000000",
+            "regolith.lockscreen.wallpaper.file: ~/lock.png",
+        ]);
+        assert_eq!(args.unwrap(), ["swaylock", "-f", "-c", "000000"]);
+    }
+
+    #[test]
+    fn locker_can_be_joined_with_other_commands() {
+        let lock = Manager::get_lock_cmd(LOCKER, Duration::from_millis(5000));
+        assert!(!lock.contains('\n'));
+        let joined = format!("true;{lock};true");
+        let status = Command::new("sh")
+            .args(["-n", "-c", &joined])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{joined}");
     }
 }
