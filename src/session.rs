@@ -50,8 +50,13 @@ struct SessionInhibitors {
 impl SessionInhibitors {
     fn new() -> Self {
         Self {
-            idle: Lock::new("idle"),
-            sleep: Lock::new("sleep"),
+            // swayidle follows logind's (strong) idle locks.
+            idle: Lock::new("idle", "block"),
+            // GNOME's suspend inhibition holds back automatic suspend only;
+            // powerd leaves its idle suspend out itself (see `IdleState`).
+            // A strong lock would also refuse the user's own suspend
+            // requests, so mirror it the way gnome-session does: weak.
+            sleep: Lock::new("sleep", "block-weak"),
         }
     }
 
@@ -67,14 +72,17 @@ impl SessionInhibitors {
 /// Mirror GNOME's aggregated inhibition state to logind. Swayidle consumes
 /// logind's idle lock through BlockInhibited without needing a restart.
 /// Never returns: connection failures are logged and retried.
-pub async fn run_inhibits(settings: Rc<crate::SessionSettings>) {
+pub async fn run_inhibits(settings: Rc<crate::SessionSettings>, idle: crate::IdleState) {
     loop {
         let result: Result<()> = async {
             let session_bus = zbus::Connection::session().await?;
             let system_bus = zbus::Connection::system().await?;
-            watch_session_inhibits(&session_bus, &system_bus, || {
-                poll_interval(settings.idle_delay())
-            })
+            watch_session_inhibits(
+                &session_bus,
+                &system_bus,
+                || poll_interval(settings.idle_delay()),
+                |actions| idle.update(|c| c.suspend_inhibited = actions & INHIBIT_SUSPEND != 0),
+            )
             .await
         }
         .await;
@@ -100,6 +108,7 @@ async fn sync_from_session(
     session_bus: &zbus::fdo::DBusProxy<'_>,
     logind: &LogindProxy<'_>,
     inhibitors: &mut SessionInhibitors,
+    on_actions: &impl Fn(u32),
 ) -> Result<()> {
     let actions = match session.inhibited_actions().await {
         Ok(actions) => actions,
@@ -108,6 +117,7 @@ async fn sync_from_session(
         Err(_) if session_manager_gone(session_bus).await => 0,
         Err(e) => return Err(e),
     };
+    on_actions(actions);
     inhibitors.apply(logind, actions).await
 }
 
@@ -115,6 +125,7 @@ async fn watch_session_inhibits(
     session_bus: &zbus::Connection,
     system_bus: &zbus::Connection,
     next_poll_delay: impl Fn() -> Duration,
+    on_actions: impl Fn(u32),
 ) -> Result<()> {
     let logind = LogindProxy::new(system_bus).await?;
     // Caching must stay off: a cached value is kept fresh by change signals,
@@ -146,7 +157,15 @@ async fn watch_session_inhibits(
     // Never propagate a failed first reconciliation: it would abort the
     // watcher and drop locks already taken. The loop below keeps retrying
     // on every tick.
-    if let Err(e) = sync_from_session(&session, &session_dbus, &logind, &mut inhibitors).await {
+    if let Err(e) = sync_from_session(
+        &session,
+        &session_dbus,
+        &logind,
+        &mut inhibitors,
+        &on_actions,
+    )
+    .await
+    {
         warn_reconcile_failed(e);
     }
 
@@ -172,7 +191,15 @@ async fn watch_session_inhibits(
             // Schedule the next tick before the slow D-Bus work below.
             tick = glib::timeout_future(next_poll_delay());
         }
-        if let Err(e) = sync_from_session(&session, &session_dbus, &logind, &mut inhibitors).await {
+        if let Err(e) = sync_from_session(
+            &session,
+            &session_dbus,
+            &logind,
+            &mut inhibitors,
+            &on_actions,
+        )
+        .await
+        {
             // A transient read failure keeps the last known lock state; the
             // next tick retries, including after a GNOME service restart.
             warn_reconcile_failed(e);
@@ -183,6 +210,7 @@ async fn watch_session_inhibits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::io::{ErrorKind, Read};
     use std::os::unix::io::{FromRawFd, IntoRawFd};
     use std::os::unix::net::UnixStream;
@@ -211,7 +239,14 @@ mod tests {
         async fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> OwnedFd {
             assert_eq!(who, crate::logind::WHO);
             assert_eq!(why, "GNOME session inhibition");
-            assert_eq!(mode, "block");
+            assert_eq!(
+                mode,
+                if what == "idle" {
+                    "block"
+                } else {
+                    "block-weak"
+                }
+            );
             let (lock, observer) = UnixStream::pair().unwrap();
             observer.set_nonblocking(true).unwrap();
             self.0.send((what.to_owned(), observer)).await.unwrap();
@@ -271,14 +306,23 @@ mod tests {
         // Counts how often the watcher scheduled a periodic tick.
         let ticks = Arc::new(AtomicUsize::new(0));
         let tick_counter = ticks.clone();
-        let watch = watch_session_inhibits(&client, &client, move || {
-            tick_counter.fetch_add(1, Ordering::SeqCst);
-            Duration::from_secs(1)
-        });
+        // The inhibited actions last passed on to the idle timers.
+        let seen = Rc::new(Cell::new(u32::MAX));
+        let seen_by_watcher = seen.clone();
+        let watch = watch_session_inhibits(
+            &client,
+            &client,
+            move || {
+                tick_counter.fetch_add(1, Ordering::SeqCst);
+                Duration::from_secs(1)
+            },
+            move |actions| seen_by_watcher.set(actions),
+        );
         let sequence = async {
             // Initial state is read even before any signal has arrived.
             let (what, idle) = calls.recv().await.unwrap();
             assert_eq!(what, "idle");
+            assert_eq!(seen.get(), INHIBIT_IDLE);
             // Multiple reads of the same state must not acquire extra locks.
             glib::timeout_future(Duration::from_millis(250)).await;
             assert!(calls.try_recv().is_err());
@@ -297,6 +341,8 @@ mod tests {
                 }
             };
             assert_eq!(what, "sleep");
+            // The idle timers learn of it too, before logind does.
+            assert_eq!(seen.get(), INHIBIT_SUSPEND);
             await_released(idle).await;
 
             // Intentionally omit PropertiesChanged: an uncached periodic

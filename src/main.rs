@@ -18,11 +18,12 @@ mod screensaver;
 mod session;
 
 /// What decides the idle actions besides the settings: the power source
-/// (UPower's `OnBattery`). gnome-settings-daemon re-arms its idle timers
-/// when it changes.
+/// (UPower's `OnBattery`) and whether a GNOME application inhibits suspend.
+/// gnome-settings-daemon re-arms its idle timers when either changes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IdleContext {
     pub on_battery: bool,
+    pub suspend_inhibited: bool,
 }
 
 /// Shared idle context plus a way to ask the manager to re-arm the timers.
@@ -302,6 +303,12 @@ impl Manager {
     /// the timers when the source changes. None when there is nothing to
     /// arm: the type is nothing (or interactive), or the timeout is 0, which
     /// means never.
+    ///
+    /// A suspend or hibernate action is left out while a GNOME application
+    /// inhibits suspend: that inhibition holds back automatic suspend only,
+    /// so logind's lock for it is weak and explicit requests (power button,
+    /// keybinding) still go through. The manager re-arms the timers when the
+    /// inhibitor goes away.
     fn sleep_timeout(
         ctx: IdleContext,
         ac_type: SleepInactiveAcType,
@@ -309,11 +316,24 @@ impl Manager {
         battery_type: SleepInactiveBatteryType,
         battery_timeout: i32,
     ) -> Option<SleepTimeout> {
-        let ((action, resume), timeout) = if ctx.on_battery {
-            (Self::battery_sleep_cmds(battery_type), battery_timeout)
+        let ((action, resume), timeout, sleeps) = if ctx.on_battery {
+            use SleepInactiveBatteryType::*;
+            (
+                Self::battery_sleep_cmds(battery_type),
+                battery_timeout,
+                matches!(battery_type, Suspend | Hibernate),
+            )
         } else {
-            (Self::ac_sleep_cmds(ac_type), ac_timeout)
+            use SleepInactiveAcType::*;
+            (
+                Self::ac_sleep_cmds(ac_type),
+                ac_timeout,
+                matches!(ac_type, Suspend | Hibernate),
+            )
         };
+        if sleeps && ctx.suspend_inhibited {
+            return None;
+        }
         Some(SleepTimeout {
             timeout: u32::try_from(timeout).ok().filter(|t| *t > 0)?,
             action: action?,
@@ -620,8 +640,14 @@ mod idle_tests {
         SleepInactiveBatteryType as Battery, SleepTimeout, DISPLAY_OFF, DISPLAY_ON,
     };
 
-    const ON_AC: IdleContext = IdleContext { on_battery: false };
-    const ON_BATTERY: IdleContext = IdleContext { on_battery: true };
+    const ON_AC: IdleContext = IdleContext {
+        on_battery: false,
+        suspend_inhibited: false,
+    };
+    const ON_BATTERY: IdleContext = IdleContext {
+        on_battery: true,
+        suspend_inhibited: false,
+    };
 
     #[test]
     fn only_the_sleep_action_of_the_power_source_in_use_is_armed() {
@@ -661,6 +687,41 @@ mod idle_tests {
         assert_eq!(
             Manager::sleep_timeout(ON_BATTERY, Ac::Suspend, 1200, Battery::Suspend, 0),
             None
+        );
+    }
+
+    #[test]
+    fn idle_suspend_and_hibernate_are_held_back_while_suspend_is_inhibited() {
+        let inhibited = |on_battery| IdleContext {
+            on_battery,
+            suspend_inhibited: true,
+        };
+        for ctx in [inhibited(false), inhibited(true)] {
+            for (ac, battery) in [
+                (Ac::Suspend, Battery::Suspend),
+                (Ac::Hibernate, Battery::Hibernate),
+            ] {
+                assert_eq!(Manager::sleep_timeout(ctx, ac, 60, battery, 60), None);
+            }
+        }
+        // The other actions go on.
+        let blank = SleepTimeout {
+            timeout: 60,
+            action: DISPLAY_OFF,
+            resume: Some(DISPLAY_ON),
+        };
+        assert_eq!(
+            Manager::sleep_timeout(inhibited(false), Ac::Blank, 60, Battery::Suspend, 30),
+            Some(blank)
+        );
+        let logout = SleepTimeout {
+            timeout: 30,
+            action: "gnome-session-quit --no-prompt",
+            resume: None,
+        };
+        assert_eq!(
+            Manager::sleep_timeout(inhibited(true), Ac::Suspend, 60, Battery::Logout, 30),
+            Some(logout)
         );
     }
 
@@ -860,12 +921,12 @@ fn main() {
 
     // Bridge GNOME session inhibition to logind, which swayidle already honors.
     let session_settings = Rc::new(SessionSettings::new());
-    glib::spawn_future_local(session::run_inhibits(session_settings.clone()));
-
-    let manager = Manager::new(session_settings);
+    let manager = Manager::new(session_settings.clone());
+    let idle = manager.idle_state();
+    glib::spawn_future_local(session::run_inhibits(session_settings, idle.clone()));
 
     // Follow the power source, as gnome-settings-daemon does through UPower.
-    glib::spawn_future_local(power_source::run(manager.idle_state()));
+    glib::spawn_future_local(power_source::run(idle));
 
     manager.run().expect("Failed to run");
 
