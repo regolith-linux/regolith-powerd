@@ -62,6 +62,7 @@ impl Manager {
             .send_blocking(())
             .expect("Failed to send reload");
         self.power_settings.handle_power_btn_action_change()?;
+        rebind_power_button_after_reloads();
 
         let send_reload_cb = || {
             let tx_cpy = send_reload_event.clone();
@@ -372,6 +373,107 @@ enum KeySymAction {
 }
 
 const POWER_OFF_KEY: &str = "XF86Poweroff";
+
+/// Bind the power button again after every sway reload.
+///
+/// The binding is added over sway IPC, and `swaymsg reload` (Super+Shift+C,
+/// and `regolith-look` after every look change) rebuilds the bindings from
+/// the config files, which drops it. powerd keeps logind's power key
+/// inhibitor, so the button then did nothing at all.
+///
+/// The reload events are read in a thread of their own, as the sway IPC
+/// client blocks; the binding is set on the main context, where the
+/// settings live.
+fn rebind_power_button_after_reloads() {
+    let (send_reload, recv_reload) = async_channel::unbounded();
+    std::thread::spawn(move || {
+        let result = swayipc::Connection::new().and_then(|conn| {
+            watch_sway_reloads(conn, || {
+                let _ = send_reload.try_send(());
+            })
+        });
+        if let Err(e) = result {
+            g_log!(
+                glib::LogLevel::Warning,
+                "Stopped following sway reloads: {e}"
+            );
+        }
+    });
+    glib::spawn_future_local(async move {
+        let power_settings = PowerSettings::new();
+        while recv_reload.recv().await.is_ok() {
+            if let Err(e) = power_settings.handle_power_btn_action_change() {
+                g_log!(
+                    glib::LogLevel::Warning,
+                    "Cannot bind the power button after a sway reload: {e}"
+                );
+            }
+        }
+    });
+}
+
+/// Call `on_reload` after every sway config reload (the workspace event
+/// with change `reload`, sent once the new config is in place), until the
+/// connection to sway ends.
+fn watch_sway_reloads(
+    conn: swayipc::Connection,
+    mut on_reload: impl FnMut(),
+) -> swayipc::Fallible<()> {
+    for event in conn.subscribe([swayipc::EventType::Workspace])? {
+        if let swayipc::Event::Workspace(workspace) = event? {
+            if workspace.change == swayipc::WorkspaceChange::Reload {
+                on_reload();
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod sway_reload_tests {
+    use super::watch_sway_reloads;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    /// A sway IPC message: magic, payload length, type, payload.
+    fn ipc_message(kind: u32, payload: &str) -> Vec<u8> {
+        let mut msg = b"i3-ipc".to_vec();
+        msg.extend((payload.len() as u32).to_ne_bytes());
+        msg.extend(kind.to_ne_bytes());
+        msg.extend(payload.as_bytes());
+        msg
+    }
+
+    #[test]
+    fn follows_sway_reloads_until_sway_goes_away() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let fake_sway = std::thread::spawn(move || {
+            let mut header = [0u8; 14];
+            server.read_exact(&mut header).unwrap();
+            assert_eq!(&header[..6], b"i3-ipc");
+            let len = u32::from_ne_bytes(header[6..10].try_into().unwrap());
+            let kind = u32::from_ne_bytes(header[10..14].try_into().unwrap());
+            let mut payload = vec![0u8; len as usize];
+            server.read_exact(&mut payload).unwrap();
+            assert_eq!(kind, 2, "SUBSCRIBE");
+            assert_eq!(String::from_utf8(payload).unwrap(), r#"["workspace"]"#);
+            server
+                .write_all(&ipc_message(2, r#"{"success":true}"#))
+                .unwrap();
+            // Workspace events; only "reload" counts.
+            for change in ["reload", "init", "empty", "reload"] {
+                let event = format!(r#"{{"change":"{change}","current":null,"old":null}}"#);
+                server.write_all(&ipc_message(0x8000_0000, &event)).unwrap();
+            }
+            // Dropping the socket stands for sway exiting.
+        });
+        let mut reloads = 0;
+        let result = watch_sway_reloads(swayipc::Connection::from(client), || reloads += 1);
+        fake_sway.join().unwrap();
+        assert_eq!(reloads, 2);
+        assert!(result.is_err());
+    }
+}
 
 impl PowerSettings {
     // Requires settings HandlePowerKey=ignore in logind.conf
