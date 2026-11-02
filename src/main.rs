@@ -130,8 +130,8 @@ impl Manager {
 
     fn get_swayidle_args(&self) -> Vec<String> {
         let mut args = Vec::new();
-        let display_off = format!("swaymsg output '*' dpms off");
-        let display_on = format!("swaymsg output '*' dpms on");
+        let display_off = DISPLAY_OFF.to_owned();
+        let display_on = DISPLAY_ON.to_owned();
 
         let default_lock = format!(
             "gtklock -d --background $(trawlcat regolith.lockscreen.wallpaper.file /dev/null)"
@@ -184,38 +184,10 @@ impl Manager {
             }
         }
 
-        let (idle_action_ac_opt, resume_action_ac_opt) = {
-            use SleepInactiveAcType::*;
-            match self.power_settings.sleep_inactive_ac_type() {
-                Suspend => (Some("systemctl suspend"), None),
-                Hibernate => (Some("systemctl hibernate"), None),
-                Blank => (
-                    Some("swaymsg output * dpms off"),
-                    Some("swaymsg output * dpms on"),
-                ),
-                Shutdown => (Some("poweroff"), None),
-                Logout => (Some("gnome-session-quit --no-prompt"), None),
-                // TODO: Show some gui prompt to the user; until then, do nothing
-                Interactive => (None, None),
-                _ => (None, None),
-            }
-        };
-        let (idle_action_bat_opt, resume_action_bat_opt) = {
-            use SleepInactiveBatteryType::*;
-            match self.power_settings.sleep_inactive_battery_type() {
-                Suspend => (Some("systemctl suspend"), None),
-                Hibernate => (Some("systemctl hibernate"), None),
-                Blank => (
-                    Some("swaymsg output * dpms off"),
-                    Some("swaymsg output * dpms on"),
-                ),
-                Shutdown => (Some("poweroff"), None),
-                Logout => (Some("gnome-session-quit --no-prompt"), None),
-                // TODO: Show some gui prompt to the user; until then, do nothing
-                Interactive => (None, None),
-                _ => (None, None),
-            }
-        };
+        let (idle_action_ac_opt, resume_action_ac_opt) =
+            Self::ac_sleep_cmds(self.power_settings.sleep_inactive_ac_type());
+        let (idle_action_bat_opt, resume_action_bat_opt) =
+            Self::battery_sleep_cmds(self.power_settings.sleep_inactive_battery_type());
 
         // A sleep-inactive timeout of 0 means never
         let ac_timeout = self.power_settings.sleep_inactive_ac_timeout();
@@ -266,6 +238,39 @@ impl Manager {
             .settings_schema()
             .is_some_and(|schema| schema.has_key(LOCK_ON_SUSPEND_KEY));
         !has_key || self.screensaver_settings.boolean(LOCK_ON_SUSPEND_KEY)
+    }
+
+    /// Commands for the sleep-inactive type on AC: the one to run when the
+    /// timeout is hit and, if any, the one to run when the user comes back.
+    fn ac_sleep_cmds(action: SleepInactiveAcType) -> (Option<&'static str>, Option<&'static str>) {
+        use SleepInactiveAcType::*;
+        match action {
+            Suspend => (Some("systemctl suspend"), None),
+            Hibernate => (Some("systemctl hibernate"), None),
+            Blank => (Some(DISPLAY_OFF), Some(DISPLAY_ON)),
+            Shutdown => (Some("poweroff"), None),
+            Logout => (Some("gnome-session-quit --no-prompt"), None),
+            // TODO: Show some gui prompt to the user; until then, do nothing
+            Interactive => (None, None),
+            _ => (None, None),
+        }
+    }
+
+    /// Commands for the sleep-inactive type on battery, as [`Self::ac_sleep_cmds`].
+    fn battery_sleep_cmds(
+        action: SleepInactiveBatteryType,
+    ) -> (Option<&'static str>, Option<&'static str>) {
+        use SleepInactiveBatteryType::*;
+        match action {
+            Suspend => (Some("systemctl suspend"), None),
+            Hibernate => (Some("systemctl hibernate"), None),
+            Blank => (Some(DISPLAY_OFF), Some(DISPLAY_ON)),
+            Shutdown => (Some("poweroff"), None),
+            Logout => (Some("gnome-session-quit --no-prompt"), None),
+            // TODO: Show some gui prompt to the user; until then, do nothing
+            Interactive => (None, None),
+            _ => (None, None),
+        }
     }
 
     fn get_timeout_cmd(timeout: u32, action: &str) -> Vec<String> {
@@ -322,6 +327,57 @@ impl Manager {
              while [ $i -lt {checks} ] && kill -0 $lock_pid 2>/dev/null; do \
              sleep 0.1; i=$((i + 1)); done"
         )
+    }
+}
+
+/// Turn every output off and on again. swayidle runs its commands through
+/// `sh -c` in powerd's working directory (the home directory), so the `*`
+/// has to be quoted, or the shell replaces it with the file names there.
+const DISPLAY_OFF: &str = "swaymsg output '*' dpms off";
+const DISPLAY_ON: &str = "swaymsg output '*' dpms on";
+
+#[cfg(test)]
+mod display_cmd_tests {
+    use super::{Manager, SleepInactiveAcType, SleepInactiveBatteryType, DISPLAY_OFF, DISPLAY_ON};
+    use std::{fs, process::Command};
+
+    /// Run `cmd` the way swayidle does (`sh -c`), from a directory that
+    /// holds files, as the home directory does, with `swaymsg` replaced by a
+    /// shell function that prints its arguments. Returns what it printed.
+    fn swaymsg_args(name: &str, cmd: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "regolith-powerd-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("Desktop")).unwrap();
+        fs::create_dir_all(dir.join("Documents")).unwrap();
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!("swaymsg() {{ echo \"$@\"; }}\n{cmd}"))
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn blank_turns_every_output_off_and_on() {
+        let cmds = [
+            Manager::ac_sleep_cmds(SleepInactiveAcType::Blank),
+            Manager::battery_sleep_cmds(SleepInactiveBatteryType::Blank),
+        ];
+        for (off, on) in cmds {
+            assert_eq!(swaymsg_args("blank", off.unwrap()), "output * dpms off");
+            assert_eq!(swaymsg_args("blank", on.unwrap()), "output * dpms on");
+        }
+    }
+
+    #[test]
+    fn display_off_and_on_turn_every_output_off_and_on() {
+        assert_eq!(swaymsg_args("display", DISPLAY_OFF), "output * dpms off");
+        assert_eq!(swaymsg_args("display", DISPLAY_ON), "output * dpms on");
     }
 }
 
