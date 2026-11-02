@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="gsettings-desktop-schemas">
+  <schema id="org.gnome.desktop.lockdown" path="/org/gnome/desktop/lockdown/">
+    <key name="disable-lock-screen" type="b">
+      <default>false</default>
+      <summary>Disable lock screen</summary>
+      <description>
+        Prevent the user to lock his screen.
+      </description>
+    </key>
+
+  </schema>
+
+</schemalist>

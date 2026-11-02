@@ -19,6 +19,7 @@ struct Manager {
     power_settings: PowerSettings,
     session_settings: Rc<SessionSettings>,
     screensaver_settings: ScreensaverSettings,
+    lockdown_settings: LockdownSettings,
 }
 
 #[gen_settings(
@@ -39,6 +40,12 @@ pub struct SessionSettings;
 )]
 pub struct ScreensaverSettings;
 
+#[gen_settings(
+    file = "org.gnome.desktop.lockdown.gschema.xml",
+    id = "org.gnome.desktop.lockdown"
+)]
+pub struct LockdownSettings;
+
 // Added by Ubuntu's gsettings-desktop-schemas; upstream GNOME has no such key.
 // It is left out of the schema file above on purpose: gen_settings generates
 // accessors from that file at build time, but they read the schema installed
@@ -52,6 +59,7 @@ impl Manager {
             session_settings,
             power_settings: PowerSettings::new(),
             screensaver_settings: ScreensaverSettings::new(),
+            lockdown_settings: LockdownSettings::new(),
         }
     }
     pub fn run(self) -> Result<(), Box<dyn Error>> {
@@ -101,6 +109,11 @@ impl Manager {
         let tx_cpy = send_reload_event.clone();
         self.screensaver_settings
             .connect_changed(Some(LOCK_ON_SUSPEND_KEY), move |_, _| {
+                tx_cpy.send_blocking(()).expect("Cannot reload config");
+            });
+        let tx_cpy = send_reload_event.clone();
+        self.lockdown_settings
+            .connect_disable_lock_screen_changed(move |_| {
                 tx_cpy.send_blocking(()).expect("Cannot reload config");
             });
         self.session_settings.connect_idle_delay_changed(move |_| {
@@ -166,6 +179,12 @@ impl Manager {
             args.append(&mut swayidle_dim_resume_args);
         }
 
+        let locks = lock_triggers(
+            self.screensaver_settings.lock_enabled(),
+            self.lock_on_suspend(),
+            self.lockdown_settings.disable_lock_screen(),
+        );
+
         if idle_delay_sec > 0 {
             // Display off at 5 seconds after idle timeout, whether or not the screen dims
             let display_off_timeout_sec = idle_delay_sec.saturating_add(5);
@@ -176,7 +195,7 @@ impl Manager {
             args.append(&mut swayidle_display_off_resume_args);
 
             // Locked lock-delay seconds after display off
-            if self.screensaver_settings.lock_enabled() {
+            if locks.idle {
                 let lock_delay_sec = self.screensaver_settings.lock_delay();
                 let lock_timeout_sec = display_off_timeout_sec.saturating_add(lock_delay_sec);
                 let mut swayidle_lock_timeout_args =
@@ -244,7 +263,7 @@ impl Manager {
         }
 
         let pause_audio = format!("playerctl -a pause");
-        let before_sleep = if self.lock_on_suspend() {
+        let before_sleep = if locks.before_sleep {
             format!("{display_off};{lock_screen};{pause_audio};sleep 1")
         } else {
             format!("{display_off};{pause_audio};sleep 1")
@@ -252,10 +271,12 @@ impl Manager {
         let after_resume = display_on.clone();
         let mut before_sleep_args = vec!["before-sleep".to_owned(), before_sleep];
         let mut after_resum_args = vec!["after-resume".to_owned(), after_resume];
-        let mut lock_screen_args = vec!["lock".to_owned(), lock_screen];
         args.append(&mut before_sleep_args);
         args.append(&mut after_resum_args);
-        args.append(&mut lock_screen_args);
+        if locks.on_request {
+            let mut lock_screen_args = vec!["lock".to_owned(), lock_screen];
+            args.append(&mut lock_screen_args);
+        }
         args
     }
 
@@ -329,6 +350,68 @@ impl Manager {
 /// How long a lock command may take before swayidle carries on (the same
 /// limit as regolith-sway-clamshell's lock before sleep).
 const LOCK_WAIT: Duration = Duration::from_millis(5000);
+
+/// When swayidle locks the screen.
+#[derive(Debug, PartialEq)]
+struct LockTriggers {
+    /// lock-delay seconds after the screen turns off when idle
+    idle: bool,
+    /// before the system sleeps
+    before_sleep: bool,
+    /// on logind's `Lock` signal (`loginctl lock-session`, or `Lock` on
+    /// `org.gnome.ScreenSaver`)
+    on_request: bool,
+}
+
+/// When to lock, from the screensaver settings `lock-enabled` and
+/// `ubuntu-lock-on-suspend` and the lockdown setting `disable-lock-screen`.
+///
+/// `disable-lock-screen` keeps the screen from being locked at all, as
+/// gnome-flashback and GNOME Shell do: no lock when idle, before sleep or on
+/// request. The screen still turns off. `lock-enabled` only turns off the
+/// idle lock.
+fn lock_triggers(
+    lock_enabled: bool,
+    lock_on_suspend: bool,
+    lock_screen_disabled: bool,
+) -> LockTriggers {
+    LockTriggers {
+        idle: lock_enabled && !lock_screen_disabled,
+        before_sleep: lock_on_suspend && !lock_screen_disabled,
+        on_request: !lock_screen_disabled,
+    }
+}
+
+#[cfg(test)]
+mod lock_trigger_tests {
+    use super::{lock_triggers, LockTriggers};
+
+    #[test]
+    fn lock_triggers_follow_the_settings() {
+        // (lock-enabled, ubuntu-lock-on-suspend, disable-lock-screen)
+        //     -> (idle, before sleep, on request)
+        let cases = [
+            ((true, true, false), (true, true, true)),
+            ((false, true, false), (false, true, true)),
+            ((true, false, false), (true, false, true)),
+            ((false, false, false), (false, false, true)),
+            // disable-lock-screen wins over the other two
+            ((true, true, true), (false, false, false)),
+            ((false, false, true), (false, false, false)),
+        ];
+        for ((enabled, on_suspend, disabled), (idle, before_sleep, on_request)) in cases {
+            assert_eq!(
+                lock_triggers(enabled, on_suspend, disabled),
+                LockTriggers {
+                    idle,
+                    before_sleep,
+                    on_request
+                },
+                "lock-enabled {enabled}, lock-on-suspend {on_suspend}, disabled {disabled}"
+            );
+        }
+    }
+}
 
 /// Stop a swayidle started by [`Manager::run`] and reap it.
 ///
