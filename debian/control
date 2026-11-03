@@ -21,6 +21,7 @@ Depends:
  swayidle,
  sway | sway-regolith,
  light,
+ bc,
  gnome-session-bin,
  powermgmt-base,
  trawldb,
