@@ -32,12 +32,19 @@ pub async fn setup_logind_inhibits() -> Result<OwnedFd> {
 /// owns an fd; dropping the fd releases the inhibitor.
 pub struct Lock {
     what: &'static str,
+    mode: &'static str,
     fd: Option<OwnedFd>,
 }
 
 impl Lock {
-    pub fn new(what: &'static str) -> Self {
-        Self { what, fd: None }
+    /// `mode` is logind's lock mode: `block` refuses every request, while
+    /// `block-weak` only holds back requests nobody explicitly asked for.
+    pub fn new(what: &'static str, mode: &'static str) -> Self {
+        Self {
+            what,
+            mode,
+            fd: None,
+        }
     }
 
     /// Release the lock when `wanted` is false, take it when true and not yet
@@ -48,7 +55,7 @@ impl Lock {
         } else if self.fd.is_none() {
             self.fd = Some(
                 proxy
-                    .Inhibit(self.what, WHO, "GNOME session inhibition", "block")
+                    .Inhibit(self.what, WHO, "GNOME session inhibition", self.mode)
                     .await?,
             );
         }
