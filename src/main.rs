@@ -66,17 +66,13 @@ impl Manager {
         let (send_reload_event, recv_reload_event) = async_channel::bounded(1);
 
         // Send initial Reload
-        send_reload_event
-            .send_blocking(())
-            .expect("Failed to send reload");
+        request_reload(&send_reload_event);
         self.power_settings.handle_power_btn_action_change()?;
         rebind_power_button_after_reloads();
 
         let send_reload_cb = || {
             let tx_cpy = send_reload_event.clone();
-            return move |_: &PowerSettings| {
-                tx_cpy.send_blocking(()).expect("Cannot reload config");
-            };
+            return move |_: &PowerSettings| request_reload(&tx_cpy);
         };
 
         self.power_settings
@@ -98,9 +94,7 @@ impl Manager {
             });
         let send_screensaver_reload_cb = || {
             let tx_cpy = send_reload_event.clone();
-            return move |_: &ScreensaverSettings| {
-                tx_cpy.send_blocking(()).expect("Cannot reload config");
-            };
+            return move |_: &ScreensaverSettings| request_reload(&tx_cpy);
         };
         self.screensaver_settings
             .connect_lock_enabled_changed(send_screensaver_reload_cb());
@@ -109,19 +103,13 @@ impl Manager {
         let tx_cpy = send_reload_event.clone();
         self.screensaver_settings
             .connect_changed(Some(LOCK_ON_SUSPEND_KEY), move |_, _| {
-                tx_cpy.send_blocking(()).expect("Cannot reload config");
+                request_reload(&tx_cpy)
             });
         let tx_cpy = send_reload_event.clone();
         self.lockdown_settings
-            .connect_disable_lock_screen_changed(move |_| {
-                tx_cpy.send_blocking(()).expect("Cannot reload config");
-            });
-        self.session_settings.connect_idle_delay_changed(move |_| {
-            send_reload_event
-                .clone()
-                .send_blocking(())
-                .expect("Failed to reload");
-        });
+            .connect_disable_lock_screen_changed(move |_| request_reload(&tx_cpy));
+        self.session_settings
+            .connect_idle_delay_changed(move |_| request_reload(&send_reload_event));
 
         let mut sway_idle_child: Option<Child> = None;
         glib::spawn_future_local(async move {
@@ -343,6 +331,47 @@ impl Manager {
              while [ $i -lt {checks} ] && kill -0 $lock_pid 2>/dev/null; do \
              sleep 0.1; i=$((i + 1)); done"
         )
+    }
+}
+
+/// Ask [`Manager::run`] to restart swayidle with the current settings.
+///
+/// Never blocks. The receiver runs on this same main context, so waiting
+/// for room in the channel would wait forever: GSettings emits one `changed`
+/// signal per key from a single dispatch, and a change of two keys at once
+/// (`gsettings reset-recursively`, `dconf load`) used to hang the daemon on
+/// the second one. A reload already queued covers this one, as swayidle's
+/// arguments are read when the reload runs.
+fn request_reload(reload: &async_channel::Sender<()>) {
+    let _ = reload.try_send(());
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::request_reload;
+    use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn reload_requests_never_block_and_coalesce() {
+        let (send, recv) = async_channel::bounded(1);
+        // Nothing reads the channel meanwhile, as when the requests come
+        // from signal handlers on the receiver's own main context.
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                request_reload(&send);
+            }
+            done.send(send).unwrap();
+        });
+        let send = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a reload request blocked");
+        // One reload is queued; it covers all three requests.
+        assert_eq!(recv.try_recv(), Ok(()));
+        assert!(recv.try_recv().is_err());
+        // Once it has been taken, the next request queues a new one.
+        request_reload(&send);
+        assert_eq!(recv.try_recv(), Ok(()));
     }
 }
 
