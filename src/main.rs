@@ -2,6 +2,7 @@ use gio::{prelude::*, Application, ApplicationFlags};
 use glib::g_log;
 use gsettings_macro::gen_settings;
 use std::{
+    cell::Cell,
     error::Error,
     mem::ManuallyDrop,
     process::{Child, Command},
@@ -12,14 +13,60 @@ use swayipc;
 
 mod battery;
 mod logind;
+mod power_source;
 mod screensaver;
 mod session;
+
+/// What decides the idle actions besides the settings: the power source
+/// (UPower's `OnBattery`). gnome-settings-daemon re-arms its idle timers
+/// when it changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdleContext {
+    pub on_battery: bool,
+}
+
+/// Shared idle context plus a way to ask the manager to re-arm the timers.
+#[derive(Clone)]
+pub struct IdleState {
+    context: Rc<Cell<IdleContext>>,
+    reload: async_channel::Sender<()>,
+}
+
+impl IdleState {
+    fn new(reload: async_channel::Sender<()>) -> Self {
+        Self {
+            context: Rc::new(Cell::new(IdleContext::default())),
+            reload,
+        }
+    }
+
+    pub fn get(&self) -> IdleContext {
+        self.context.get()
+    }
+
+    /// Ask for a reload; never blocks, see [`request_reload`].
+    pub fn request_reload(&self) {
+        request_reload(&self.reload);
+    }
+
+    /// Change the context, and ask for a reload if it changed.
+    pub fn update(&self, f: impl FnOnce(&mut IdleContext)) {
+        let mut ctx = self.context.get();
+        f(&mut ctx);
+        if ctx != self.context.get() {
+            self.context.set(ctx);
+            self.request_reload();
+        }
+    }
+}
 
 struct Manager {
     power_settings: PowerSettings,
     session_settings: Rc<SessionSettings>,
     screensaver_settings: ScreensaverSettings,
     lockdown_settings: LockdownSettings,
+    idle: IdleState,
+    recv_reload_event: async_channel::Receiver<()>,
 }
 
 #[gen_settings(
@@ -55,15 +102,24 @@ const LOCK_ON_SUSPEND_KEY: &str = "ubuntu-lock-on-suspend";
 
 impl Manager {
     pub fn new(session_settings: Rc<SessionSettings>) -> Self {
+        let (send_reload_event, recv_reload_event) = async_channel::bounded(1);
         Self {
             session_settings,
             power_settings: PowerSettings::new(),
             screensaver_settings: ScreensaverSettings::new(),
             lockdown_settings: LockdownSettings::new(),
+            idle: IdleState::new(send_reload_event),
+            recv_reload_event,
         }
     }
+
+    pub fn idle_state(&self) -> IdleState {
+        self.idle.clone()
+    }
+
     pub fn run(self) -> Result<(), Box<dyn Error>> {
-        let (send_reload_event, recv_reload_event) = async_channel::bounded(1);
+        let send_reload_event = self.idle.reload.clone();
+        let recv_reload_event = self.recv_reload_event.clone();
 
         // Send initial Reload
         request_reload(&send_reload_event);
@@ -112,12 +168,23 @@ impl Manager {
             .connect_idle_delay_changed(move |_| request_reload(&send_reload_event));
 
         let mut sway_idle_child: Option<Child> = None;
+        let mut current_args: Option<Vec<String>> = None;
         glib::spawn_future_local(async move {
             while let Ok(_) = recv_reload_event.recv().await {
+                // Restarting swayidle starts its idle count again, so keep
+                // the running one when nothing it runs has changed (for
+                // example a power-source change with the same action).
+                let running = sway_idle_child
+                    .as_mut()
+                    .is_some_and(|c| matches!(c.try_wait(), Ok(None)));
+                if running && current_args.as_ref() == Some(&self.get_swayidle_args()) {
+                    continue;
+                }
                 if let Some(mut prev_child) = sway_idle_child.take() {
                     stop_swayidle(&mut prev_child).await;
                 }
                 let swayidle_args = self.get_swayidle_args();
+                current_args = Some(swayidle_args.clone());
                 let child = Command::new("swayidle")
                     .arg("-w")
                     .args(swayidle_args)
@@ -186,32 +253,18 @@ impl Manager {
             }
         }
 
-        let (idle_action_ac_opt, resume_action_ac_opt) =
-            Self::ac_sleep_cmds(self.power_settings.sleep_inactive_ac_type());
-        let (idle_action_bat_opt, resume_action_bat_opt) =
-            Self::battery_sleep_cmds(self.power_settings.sleep_inactive_battery_type());
-
-        // A sleep-inactive timeout of 0 means never
-        let ac_timeout = self.power_settings.sleep_inactive_ac_timeout();
-        if let Some(action) = idle_action_ac_opt.filter(|_| ac_timeout > 0) {
-            let on_timout = Self::get_power_source_cmd(PowerSource::Ac, action);
-            let mut swayidle_timeout_args = Self::get_timeout_cmd(ac_timeout as u32, &on_timout);
+        if let Some(sleep) = Self::sleep_timeout(
+            self.idle.get(),
+            self.power_settings.sleep_inactive_ac_type(),
+            self.power_settings.sleep_inactive_ac_timeout(),
+            self.power_settings.sleep_inactive_battery_type(),
+            self.power_settings.sleep_inactive_battery_timeout(),
+        ) {
+            let mut swayidle_timeout_args = Self::get_timeout_cmd(sleep.timeout, sleep.action);
             args.append(&mut swayidle_timeout_args);
 
-            if let Some(resume_action) = resume_action_ac_opt {
+            if let Some(resume_action) = sleep.resume {
                 let mut swayidle_resume_args = Self::get_resume_cmd(resume_action);
-                args.append(&mut swayidle_resume_args);
-            }
-        }
-
-        let bat_timeout = self.power_settings.sleep_inactive_battery_timeout();
-        if let Some(action) = idle_action_bat_opt.filter(|_| bat_timeout > 0) {
-            let on_timout = Self::get_power_source_cmd(PowerSource::Battery, action);
-            let mut swayidle_timout_args = Self::get_timeout_cmd(bat_timeout as u32, &on_timout);
-            args.append(&mut swayidle_timout_args);
-
-            if let Some(resume_action) = resume_action_bat_opt {
-                let mut swayidle_resume_args = Self::get_resume_cmd(&resume_action);
                 args.append(&mut swayidle_resume_args);
             }
         }
@@ -242,6 +295,30 @@ impl Manager {
             .settings_schema()
             .is_some_and(|schema| schema.has_key(LOCK_ON_SUSPEND_KEY));
         !has_key || self.screensaver_settings.boolean(LOCK_ON_SUSPEND_KEY)
+    }
+
+    /// The sleep-inactive timeout swayidle arms. Like gnome-settings-daemon,
+    /// only the one of the power source in use is armed; the manager re-arms
+    /// the timers when the source changes. None when there is nothing to
+    /// arm: the type is nothing (or interactive), or the timeout is 0, which
+    /// means never.
+    fn sleep_timeout(
+        ctx: IdleContext,
+        ac_type: SleepInactiveAcType,
+        ac_timeout: i32,
+        battery_type: SleepInactiveBatteryType,
+        battery_timeout: i32,
+    ) -> Option<SleepTimeout> {
+        let ((action, resume), timeout) = if ctx.on_battery {
+            (Self::battery_sleep_cmds(battery_type), battery_timeout)
+        } else {
+            (Self::ac_sleep_cmds(ac_type), ac_timeout)
+        };
+        Some(SleepTimeout {
+            timeout: u32::try_from(timeout).ok().filter(|t| *t > 0)?,
+            action: action?,
+            resume,
+        })
     }
 
     /// Commands for the sleep-inactive type on AC: the one to run when the
@@ -287,27 +364,6 @@ impl Manager {
 
     fn get_resume_cmd(action: &str) -> Vec<String> {
         vec!["resume".to_owned(), action.to_owned()]
-    }
-
-    /// Shell command that runs `action` only while on the given power source.
-    ///
-    /// `on_ac_power` exits 0 on mains power, 1 on battery and 255 when the
-    /// power source cannot be determined, which is what desktops without
-    /// power sensors report. Only exit status 1 means battery, so an unknown
-    /// power source gets the AC settings rather than the battery ones.
-    fn get_power_source_cmd(source: PowerSource, action: &str) -> String {
-        let test = match source {
-            PowerSource::Ac => "-ne",
-            PowerSource::Battery => "-eq",
-        };
-        format!(
-            r#"
-            on_ac_power
-            if [ $? {test} 1 ]; then
-                {action}
-            fi
-            "#
-        )
     }
 
     /// Shell command that starts `locker` and waits until it exits, but for
@@ -548,10 +604,84 @@ async fn stop_swayidle(child: &mut Child) {
     let _ = child.wait();
 }
 
-#[derive(Debug, Clone, Copy)]
-enum PowerSource {
-    Ac,
-    Battery,
+/// A sleep-inactive timeout for swayidle: after `timeout` seconds idle run
+/// `action`, and `resume` when the user comes back.
+#[derive(Debug, PartialEq)]
+struct SleepTimeout {
+    timeout: u32,
+    action: &'static str,
+    resume: Option<&'static str>,
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::{
+        IdleContext, IdleState, Manager, SleepInactiveAcType as Ac,
+        SleepInactiveBatteryType as Battery, SleepTimeout, DISPLAY_OFF, DISPLAY_ON,
+    };
+
+    const ON_AC: IdleContext = IdleContext { on_battery: false };
+    const ON_BATTERY: IdleContext = IdleContext { on_battery: true };
+
+    #[test]
+    fn only_the_sleep_action_of_the_power_source_in_use_is_armed() {
+        let suspend = |timeout| SleepTimeout {
+            timeout,
+            action: "systemctl suspend",
+            resume: None,
+        };
+        let blank = |timeout| SleepTimeout {
+            timeout,
+            action: DISPLAY_OFF,
+            resume: Some(DISPLAY_ON),
+        };
+        assert_eq!(
+            Manager::sleep_timeout(ON_AC, Ac::Suspend, 1200, Battery::Blank, 300),
+            Some(suspend(1200))
+        );
+        assert_eq!(
+            Manager::sleep_timeout(ON_BATTERY, Ac::Suspend, 1200, Battery::Blank, 300),
+            Some(blank(300))
+        );
+        // Nothing on the source in use: the other source's action is not
+        // armed either.
+        assert_eq!(
+            Manager::sleep_timeout(ON_AC, Ac::Nothing, 1200, Battery::Suspend, 30),
+            None
+        );
+        assert_eq!(
+            Manager::sleep_timeout(ON_BATTERY, Ac::Suspend, 1200, Battery::Nothing, 30),
+            None
+        );
+        // A timeout of 0 means never.
+        assert_eq!(
+            Manager::sleep_timeout(ON_AC, Ac::Suspend, 0, Battery::Suspend, 30),
+            None
+        );
+        assert_eq!(
+            Manager::sleep_timeout(ON_BATTERY, Ac::Suspend, 1200, Battery::Suspend, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn idle_state_asks_for_a_reload_only_when_the_context_changes() {
+        let (send, recv) = async_channel::bounded(1);
+        let idle = IdleState::new(send);
+        assert_eq!(idle.get(), ON_AC);
+        // Battery updates that leave the source as it is don't re-arm.
+        idle.update(|c| c.on_battery = false);
+        assert!(recv.try_recv().is_err());
+        idle.update(|c| c.on_battery = true);
+        assert_eq!(idle.get(), ON_BATTERY);
+        assert_eq!(recv.try_recv(), Ok(()));
+        // A second change while a reload is queued neither blocks nor
+        // queues another: the queued one reads the latest context.
+        idle.update(|c| c.on_battery = false);
+        idle.update(|c| c.on_battery = true);
+        assert_eq!(recv.try_recv(), Ok(()));
+        assert!(recv.try_recv().is_err());
+    }
 }
 
 #[derive(Debug)]
@@ -733,6 +863,10 @@ fn main() {
     glib::spawn_future_local(session::run_inhibits(session_settings.clone()));
 
     let manager = Manager::new(session_settings);
+
+    // Follow the power source, as gnome-settings-daemon does through UPower.
+    glib::spawn_future_local(power_source::run(manager.idle_state()));
+
     manager.run().expect("Failed to run");
 
     // Low-battery notifications, which gnome-settings-daemon's power
@@ -747,7 +881,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{stop_swayidle, Manager, PowerSource, LOCKER};
+    use super::{stop_swayidle, Manager, LOCKER};
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -871,44 +1005,6 @@ mod tests {
         assert!(dir.join("ignored").exists());
         assert!(child.try_wait().unwrap().is_some());
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Run the generated command with a stub `on_ac_power` that exits with
-    /// `exit_code`, and report whether the guarded action ran.
-    fn action_runs(source: PowerSource, exit_code: u8) -> bool {
-        let dir: PathBuf = std::env::temp_dir().join(format!(
-            "regolith-powerd-test-{}-{source:?}-{exit_code}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let stub = dir.join("on_ac_power");
-        fs::write(&stub, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let cmd = Manager::get_power_source_cmd(source, "echo ran");
-        let path = format!("{}:/usr/bin:/bin", dir.display());
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .env("PATH", path)
-            .output()
-            .unwrap();
-        fs::remove_dir_all(&dir).unwrap();
-        String::from_utf8_lossy(&output.stdout).trim() == "ran"
-    }
-
-    #[test]
-    fn ac_action_runs_on_ac_and_unknown_power_source() {
-        assert!(action_runs(PowerSource::Ac, 0));
-        assert!(!action_runs(PowerSource::Ac, 1));
-        assert!(action_runs(PowerSource::Ac, 255));
-    }
-
-    #[test]
-    fn battery_action_runs_only_on_battery() {
-        assert!(!action_runs(PowerSource::Battery, 0));
-        assert!(action_runs(PowerSource::Battery, 1));
-        assert!(!action_runs(PowerSource::Battery, 255));
     }
 
     /// Run the lock command with stand-ins for trawlcat (answering from
