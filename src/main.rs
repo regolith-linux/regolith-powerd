@@ -254,6 +254,10 @@ impl Manager {
             }
         }
 
+        // While the screen is locked, turn it off soon, whatever idle-delay
+        // is set to
+        args.append(&mut blank_while_locked_args());
+
         if let Some(sleep) = Self::sleep_timeout(
             self.idle.get(),
             self.power_settings.sleep_inactive_ac_type(),
@@ -499,6 +503,195 @@ mod display_cmd_tests {
     fn display_off_and_on_turn_every_output_off_and_on() {
         assert_eq!(swaymsg_args("display", DISPLAY_OFF), "output * dpms off");
         assert_eq!(swaymsg_args("display", DISPLAY_ON), "output * dpms on");
+    }
+}
+
+/// Idle seconds after which the outputs turn off while the screen is locked
+/// (gnome-settings-daemon's `SCREENSAVER_TIMEOUT_BLANK`).
+const LOCKED_BLANK_SECS: u32 = 30;
+
+/// Idle seconds after which the outputs turn off when the screen was locked
+/// after the user's last input (the lock key, or the lid).
+const JUST_LOCKED_BLANK_SECS: u32 = 5;
+
+/// Marks that the outputs were turned off by [`blank_while_locked_args`], so
+/// that only then does coming back turn them on.
+const LOCKED_BLANK_MARK: &str = "$XDG_RUNTIME_DIR/regolith-powerd-locked-blank";
+
+/// swayidle timeouts that turn the outputs off while the screen is locked,
+/// as gnome-settings-daemon does in the X11 session: soon after the screen
+/// is locked ([`JUST_LOCKED_BLANK_SECS`] of idle time, if it was locked
+/// after the last input), and after [`LOCKED_BLANK_SECS`] of idle time when
+/// the user woke the lock screen and left it again.
+///
+/// The lock key and the lid close start the lock screen directly, not
+/// through swayidle, and the idle timeouts count from the last key press.
+/// So after Super+Escape the outputs stayed on until idle-delay + 5 seconds
+/// (more than 5 minutes by default), and never with Screen Blank set to
+/// Never.
+///
+/// Whether and since when the screen is locked comes from
+/// `org.gnome.ScreenSaver`, which this daemon provides (see
+/// [`screensaver`]). When the outputs were not turned off here, coming back
+/// leaves them alone, so it doesn't turn on an output that something else
+/// turned off.
+fn blank_while_locked_args() -> Vec<String> {
+    let mut args = Vec::new();
+    for (timeout, locked_for_at_most) in [
+        // Locked for no longer than the user has been idle
+        (JUST_LOCKED_BLANK_SECS, Some(JUST_LOCKED_BLANK_SECS)),
+        (LOCKED_BLANK_SECS, None),
+    ] {
+        args.append(&mut Manager::get_timeout_cmd(
+            timeout,
+            &blank_while_locked_cmd(locked_for_at_most),
+        ));
+        args.append(&mut Manager::get_resume_cmd(&format!(
+            "if [ -e \"{LOCKED_BLANK_MARK}\" ]; then rm -f \"{LOCKED_BLANK_MARK}\"; {DISPLAY_ON}; fi"
+        )));
+    }
+    args
+}
+
+/// Shell command that turns the outputs off if the screen is locked and,
+/// with `locked_for_at_most`, has been locked for no more seconds than that.
+fn blank_while_locked_cmd(locked_for_at_most: Option<u32>) -> String {
+    const CALL: &str =
+        "busctl --user call org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver";
+    let recently = match locked_for_at_most {
+        Some(secs) => {
+            format!(" && t=$({CALL} GetActiveTime 2>/dev/null) && [ \"${{t#u }}\" -le {secs} ]")
+        }
+        None => String::new(),
+    };
+    format!(
+        "if [ \"$({CALL} GetActive 2>/dev/null)\" = \"b true\" ]{recently}; then \
+         {DISPLAY_OFF} && touch \"{LOCKED_BLANK_MARK}\"; fi"
+    )
+}
+
+#[cfg(test)]
+mod blank_while_locked_tests {
+    use super::{blank_while_locked_args, JUST_LOCKED_BLANK_SECS, LOCKED_BLANK_SECS};
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+
+    /// The swayidle arguments as (timeout, command, resume command).
+    fn timeouts() -> Vec<(u32, String, String)> {
+        let args = blank_while_locked_args();
+        args.chunks(5)
+            .map(|c| {
+                assert_eq!((c[0].as_str(), c[3].as_str()), ("timeout", "resume"));
+                (c[1].parse().unwrap(), c[2].clone(), c[4].clone())
+            })
+            .collect()
+    }
+
+    /// Run `cmd` through `sh -c`, as swayidle does, with a stand-in busctl
+    /// that answers as `org.gnome.ScreenSaver` does when `locked_for` is the
+    /// number of seconds the screen has been locked (None: not locked, or
+    /// with `no_service`, not on the bus), and a stand-in swaymsg. Returns
+    /// the swaymsg calls.
+    fn run(
+        dir: &std::path::Path,
+        cmd: &str,
+        locked_for: Option<u32>,
+        no_service: bool,
+    ) -> Vec<String> {
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let busctl = if no_service {
+            "#!/bin/sh\necho 'Call failed: The name is not activatable' >&2\nexit 1\n".to_string()
+        } else {
+            let (active, time) = match locked_for {
+                Some(t) => ("true", t),
+                None => ("false", 0),
+            };
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$1 $2 $3 $4 $5\" = \"--user call org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver\" ] || exit 2\n\
+                 case $6 in GetActive) echo 'b {active}';; GetActiveTime) echo 'u {time}';; *) exit 2;; esac\n"
+            )
+        };
+        fs::write(bin.join("busctl"), busctl).unwrap();
+        fs::write(
+            bin.join("swaymsg"),
+            "#!/bin/sh\necho \"$*\" >> \"$XDG_RUNTIME_DIR/swaymsg.log\"\n",
+        )
+        .unwrap();
+        for f in ["busctl", "swaymsg"] {
+            fs::set_permissions(bin.join(f), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let log = dir.join("swaymsg.log");
+        let _ = fs::remove_file(&log);
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("XDG_RUNTIME_DIR", dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{cmd}");
+        fs::read_to_string(&log)
+            .map(|l| l.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn outputs_turn_off_while_locked_and_on_when_the_user_comes_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "regolith-powerd-test-{}-locked-blank",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let timeouts = timeouts();
+        let secs: Vec<u32> = timeouts.iter().map(|t| t.0).collect();
+        assert_eq!(secs, [JUST_LOCKED_BLANK_SECS, LOCKED_BLANK_SECS]);
+        let (just_locked, locked) = (&timeouts[0], &timeouts[1]);
+        let off = vec!["output * dpms off".to_string()];
+        let on = vec!["output * dpms on".to_string()];
+        let none: Vec<String> = Vec::new();
+
+        // (timeout, locked for, outputs turned off)
+        let cases = [
+            (just_locked, None, false),
+            // Locked by the last input: the lock key, or the lid
+            (just_locked, Some(0), true),
+            (just_locked, Some(JUST_LOCKED_BLANK_SECS), true),
+            // The user woke the lock screen and left it again
+            (just_locked, Some(JUST_LOCKED_BLANK_SECS + 1), false),
+            (just_locked, Some(600), false),
+            (locked, None, false),
+            (locked, Some(0), true),
+            (locked, Some(600), true),
+        ];
+        for ((secs, cmd, resume), locked_for, blanks) in cases {
+            let what = format!("{secs} s idle, locked for {locked_for:?}");
+            assert_eq!(
+                run(&dir, cmd, locked_for, false),
+                if blanks { off.clone() } else { none.clone() },
+                "{what}"
+            );
+            // Coming back turns the outputs on only if they were turned off
+            // here, and only once.
+            assert_eq!(
+                run(&dir, resume, locked_for, false),
+                if blanks { on.clone() } else { none.clone() },
+                "{what}, back"
+            );
+            assert_eq!(
+                run(&dir, resume, locked_for, false),
+                none,
+                "{what}, back again"
+            );
+        }
+
+        // Without org.gnome.ScreenSaver on the bus nothing happens.
+        for (_, cmd, resume) in [just_locked, locked] {
+            assert_eq!(run(&dir, cmd, None, true), none);
+            assert_eq!(run(&dir, resume, None, true), none);
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
 
