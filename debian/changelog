@@ -1,3 +1,31 @@
+regolith-powerd (0.8.0) jammy; urgency=medium
+
+  [ Soumya Ranjan Patnaik ]
+  * refactor(logind): acquire the startup inhibitor asynchronously
+  * feat(session): mirror GNOME session inhibition onto logind locks
+  * refactor: tidy duplicated strings, imports and warnings
+  * feat(session): share session settings and cap poll interval
+  * refactor(logind): model inhibitor slots as Lock and rename session helpers
+  * fix(session): release locks on SessionManager loss and reconnect on system-bus closure
+
+  [ rego-port-bot ]
+  * fix: treat an unknown power source as AC, not battery
+  * feat: provide org.gnome.ScreenSaver in the sway session
+  * fix: keep the screen from staying dimmed or off after a reload or a lock
+  * feat: warn when the battery is low
+  * fix: honour the GNOME idle, dim and screen-lock settings in sway
+  * refactor: read the screen-lock settings through gen_settings
+  * fix: make the "blank" sleep-inactive type turn the outputs off
+  * fix: keep the power button bound after a sway reload
+  * fix: honour the lockdown setting disable-lock-screen in sway
+  * fix: lock the session when the lock-screen wallpaper path has spaces or ~
+  * fix: don't hang when two power settings change at once
+  * fix: apply the new power source's idle action after plugging in or unplugging
+  * fix: let explicit suspend through while an app inhibits suspend
+  * fix: turn the screen off soon after it is locked
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Tue, 03 Nov 2026 12:46:08 -0800
+
 regolith-powerd (0.7.0) jammy; urgency=medium
 
   [ Soumya Ranjan Patnaik ]
