@@ -14,6 +14,7 @@ use swayipc;
 mod battery;
 mod logind;
 mod power_source;
+mod profiles;
 mod screensaver;
 mod session;
 
@@ -1122,6 +1123,10 @@ fn main() {
     glib::spawn_future_local(power_source::run(idle));
 
     manager.run().expect("Failed to run");
+
+    // Hold the power-saver profile while the battery is low, as
+    // gnome-settings-daemon's power plugin does.
+    glib::spawn_future_local(profiles::run_power_saver());
 
     // Low-battery notifications, which gnome-settings-daemon's power
     // plugin gives the X11 session.
