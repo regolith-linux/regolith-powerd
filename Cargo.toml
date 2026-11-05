@@ -12,7 +12,7 @@ repository = "https://github.com/regolith-linux/regolith-powerd"
 [dependencies]
 async-channel = "2.1.1"
 gio = "0.18.4"
-glib = "0.18.5"
+glib = "0.20.0"
 gsettings-macro = "0.1.20"
 libc = "0.2"
 swayipc = "3.0.1"
