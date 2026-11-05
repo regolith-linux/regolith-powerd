@@ -26,4 +26,8 @@ Depends:
  trawldb,
  systemd,
  playerctl,
+ gsettings-desktop-schemas,
+Recommends:
+ gvfs,
+ gcr,
 Description: Daemon for using swayidle
