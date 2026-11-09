@@ -26,8 +26,14 @@ const LOGIND: &str = "org.freedesktop.login1";
 
 /// Delay between periodic reads that repair missed change signals: half the
 /// idle delay, bounded so a stale lock never outlives `MAX_POLL_SECS`.
+/// An idle delay of 0 (Screen Blank "Never") arms no idle timeout to stay
+/// ahead of, so it gets the longest delay.
 fn poll_interval(idle_delay_secs: u32) -> Duration {
-    Duration::from_secs(u64::from((idle_delay_secs / 2).clamp(1, MAX_POLL_SECS)))
+    let secs = match idle_delay_secs {
+        0 => MAX_POLL_SECS,
+        delay => (delay / 2).clamp(1, MAX_POLL_SECS),
+    };
+    Duration::from_secs(u64::from(secs))
 }
 
 #[dbus_proxy(
@@ -393,10 +399,16 @@ mod tests {
 
     #[test]
     fn poll_interval_is_half_idle_delay_within_bounds() {
-        assert_eq!(poll_interval(0), Duration::from_secs(1));
+        assert_eq!(poll_interval(1), Duration::from_secs(1));
         assert_eq!(poll_interval(60), Duration::from_secs(30));
         assert_eq!(poll_interval(600), Duration::from_secs(30));
         assert_eq!(poll_interval(20), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn poll_interval_is_longest_when_the_screen_never_blanks() {
+        // idle-delay 0 is Screen Blank "Never"
+        assert_eq!(poll_interval(0), Duration::from_secs(30));
     }
 
     #[test]
