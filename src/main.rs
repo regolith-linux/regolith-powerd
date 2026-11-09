@@ -212,10 +212,12 @@ impl Manager {
 
         let lock_screen = Self::get_lock_cmd(LOCKER, LOCK_WAIT);
 
-        // An idle delay of 0 means the session never becomes idle
-        let idle_delay_sec = self.session_settings.idle_delay();
+        let times = idle_times(
+            self.session_settings.idle_delay(),
+            self.power_settings.idle_dim(),
+        );
 
-        if idle_delay_sec > 0 && self.power_settings.idle_dim() {
+        if let Some(dim_timeout_sec) = times.dim {
             let idle_brightness = self.power_settings.idle_brightness();
             let action = format!(
                 r#"
@@ -228,7 +230,7 @@ impl Manager {
             );
 
             // Dim screen to $idle_brightness when idle dim timeout hit
-            let mut swayidle_dim_timeout_args = Self::get_timeout_cmd(idle_delay_sec, &action);
+            let mut swayidle_dim_timeout_args = Self::get_timeout_cmd(dim_timeout_sec, &action);
             let mut swayidle_dim_resume_args = Self::get_resume_cmd(&format!(
                 "light -S $(cat $XDG_RUNTIME_DIR/screen_brightness_old.var)"
             ));
@@ -242,9 +244,7 @@ impl Manager {
             self.lockdown_settings.disable_lock_screen(),
         );
 
-        if idle_delay_sec > 0 {
-            // Display off at 5 seconds after idle timeout, whether or not the screen dims
-            let display_off_timeout_sec = idle_delay_sec.saturating_add(5);
+        if let Some(display_off_timeout_sec) = times.blank {
             let mut swayidle_display_off_timeout_args =
                 Self::get_timeout_cmd(display_off_timeout_sec, &display_off);
             let mut swayidle_display_off_resume_args = Self::get_resume_cmd(&display_on);
@@ -763,6 +763,65 @@ mod lock_trigger_tests {
                     on_request
                 },
                 "lock-enabled {enabled}, lock-on-suspend {on_suspend}, disabled {disabled}"
+            );
+        }
+    }
+}
+
+/// When the screen dims and when it turns off, in seconds of idle time.
+#[derive(Debug, PartialEq)]
+struct IdleTimes {
+    dim: Option<u32>,
+    blank: Option<u32>,
+}
+
+/// The idle times for `idle-delay` (Screen Blank) and `idle-dim` (Dim
+/// Screen), as gnome-settings-daemon's power plugin sets them in the X11
+/// session (`idle_configure` and the constants in gsd-power-constants.h):
+///
+/// - The screen turns off when the session becomes idle, after idle-delay
+///   seconds. 0 (Never) turns blanking off.
+/// - With Dim Screen on, it dims at half the idle delay, or not at all when
+///   that is under 10 seconds. With Screen Blank set to Never it dims after
+///   60 seconds.
+///
+/// The idle lock follows the blank, lock-delay seconds later.
+fn idle_times(idle_delay: u32, idle_dim: bool) -> IdleTimes {
+    let blank = (idle_delay > 0).then_some(idle_delay);
+    let dim = match (idle_dim, idle_delay) {
+        (false, _) => None,
+        // IDLE_DIM_BLANK_DISABLED_MIN
+        (true, 0) => Some(60),
+        // IDLE_DELAY_TO_IDLE_DIM_MULTIPLIER and MINIMUM_IDLE_DIM_DELAY
+        (true, delay) => Some(delay / 2).filter(|&dim| dim >= 10),
+    };
+    IdleTimes { dim, blank }
+}
+
+#[cfg(test)]
+mod idle_times_tests {
+    use super::{idle_times, IdleTimes};
+
+    #[test]
+    fn dim_and_blank_follow_gnome() {
+        // (idle-delay, idle-dim) -> (dim, blank)
+        let cases = [
+            ((300, true), (Some(150), Some(300))),
+            ((300, false), (None, Some(300))),
+            ((60, true), (Some(30), Some(60))),
+            ((21, true), (Some(10), Some(21))),
+            // Half the delay is under 10 s: no dim
+            ((19, true), (None, Some(19))),
+            ((1, true), (None, Some(1))),
+            // Screen Blank Never
+            ((0, true), (Some(60), None)),
+            ((0, false), (None, None)),
+        ];
+        for ((delay, dim_on), (dim, blank)) in cases {
+            assert_eq!(
+                idle_times(delay, dim_on),
+                IdleTimes { dim, blank },
+                "idle-delay {delay}, idle-dim {dim_on}"
             );
         }
     }
