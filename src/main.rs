@@ -828,24 +828,30 @@ mod idle_times_tests {
 }
 
 /// Shell command that starts the lock screen: `wm.program.lock_sway` when it
-/// is set, else `gtklock -d` showing the lock-screen wallpaper
+/// is set, else `regolith-sway-gtklock -d` when it is installed, else
+/// `gtklock -d` showing the lock-screen wallpaper
 /// (`regolith.lockscreen.wallpaper.file`).
 ///
-/// The wallpaper path goes to gtklock as a single argument, so it may contain
-/// spaces, and a leading `~` is expanded to the home directory. When the
-/// resource is unset or the file doesn't exist, gtklock still starts, just
-/// without the image. (A path with a space used to reach gtklock as several
-/// arguments, and gtklock then crashed, leaving the session unlocked.) These
-/// are the rules of `regolith-sway-gtklock` (from regolith-wm-config's
-/// regolith-sway-gtklock package), which the lock key and the lid close
-/// script use; powerd doesn't depend on that package, so it doesn't call it.
+/// `regolith-sway-gtklock` (from regolith-wm-config's regolith-sway-gtklock
+/// package) is what the lock key and the lid close script run, so idle,
+/// suspend and logind locks show the same lock screen: the look's wallpaper
+/// or colours, and its gtklock stylesheet. powerd doesn't depend on that
+/// package, so without it gtklock is started directly. The wallpaper path
+/// then goes to gtklock as a single argument, so it may contain spaces, and
+/// a leading `~` is expanded to the home directory. When the resource is
+/// unset or the file doesn't exist, gtklock still starts, just without the
+/// image. (A path with a space used to reach gtklock as several arguments,
+/// and gtklock then crashed, leaving the session unlocked.)
 ///
 /// The group runs in the background in [`Manager::get_lock_cmd`], and each
-/// branch `exec`s the locker, so the pid that is waited for is the locker's.
-/// It is a single line, so it can be joined with other commands by `;`.
+/// branch `exec`s the locker (`regolith-sway-gtklock` `exec`s gtklock in
+/// turn), so the pid that is waited for is the locker's. It is a single
+/// line, so it can be joined with other commands by `;`.
 const LOCKER: &str = concat!(
     "{ locker=$(trawlcat wm.program.lock_sway ''); ",
     "if [ -n \"$locker\" ]; then exec $locker; fi; ",
+    "if command -v regolith-sway-gtklock >/dev/null; then ",
+    "exec regolith-sway-gtklock -d; fi; ",
     "wallpaper=$(trawlcat regolith.lockscreen.wallpaper.file ''); ",
     "case $wallpaper in '~/'*) wallpaper=$HOME/${wallpaper#'~/'};; esac; ",
     "if [ -n \"$wallpaper\" ] && [ -f \"$wallpaper\" ]; then ",
@@ -1217,8 +1223,8 @@ mod tests {
     use super::{stop_swayidle, Manager, LOCKER};
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
-        path::PathBuf,
+        os::unix::fs::{symlink, PermissionsExt},
+        path::{Path, PathBuf},
         process::Command,
         time::{Duration, Instant},
     };
@@ -1341,9 +1347,10 @@ mod tests {
     }
 
     /// Run the lock command with stand-ins for trawlcat (answering from
-    /// `resources`, "key: value" lines) and gtklock, and return the arguments
-    /// gtklock got, or None if it didn't start.
-    fn locker_args(resources: &[&str]) -> Option<Vec<String>> {
+    /// `resources`, "key: value" lines) and the lock screens, and return the
+    /// lock screen that started and its arguments, or None if none did.
+    /// regolith-sway-gtklock is installed if `script` is true.
+    fn run_locker(resources: &[&str], script: bool) -> Option<Vec<String>> {
         static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = test_dir(&format!("locker-{run}"));
@@ -1366,7 +1373,23 @@ mod tests {
              if [ -n \"$value\" ]; then printf '%s\\n' \"$value\"; else printf '%s\\n' \"$2\"; fi\n",
         )
         .unwrap();
-        for locker in ["gtklock", "swaylock"] {
+        // The few programs the command needs, so that PATH can be the stand-ins
+        // alone: a regolith-sway-gtklock installed on this system mustn't be
+        // found.
+        for tool in ["sh", "sed", "tail", "sleep"] {
+            let path = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|dir| Path::new(dir).join(tool))
+                .find(|path| path.exists())
+                .unwrap();
+            symlink(path, bin.join(tool)).unwrap();
+        }
+        let lockers: &[&str] = if script {
+            &["gtklock", "swaylock", "regolith-sway-gtklock"]
+        } else {
+            &["gtklock", "swaylock"]
+        };
+        for locker in lockers {
             fs::write(
                 bin.join(locker),
                 format!(
@@ -1383,7 +1406,7 @@ mod tests {
         let status = Command::new("sh")
             .arg("-c")
             .arg(&cmd)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PATH", &bin)
             .env("HOME", &home)
             .env("STUB_RESOURCES", dir.join("resources"))
             .env("STUB_LOG", dir.join("log"))
@@ -1397,6 +1420,25 @@ mod tests {
         });
         fs::remove_dir_all(&dir).unwrap();
         args
+    }
+
+    /// [`run_locker`] without regolith-sway-gtklock
+    fn locker_args(resources: &[&str]) -> Option<Vec<String>> {
+        run_locker(resources, false)
+    }
+
+    #[test]
+    fn locker_runs_regolith_sway_gtklock_when_it_is_installed() {
+        let args = run_locker(&["regolith.lockscreen.wallpaper.file: ~/lock.png"], true);
+        assert_eq!(args.unwrap(), ["regolith-sway-gtklock", "-d"]);
+        let unset = run_locker(&[], true);
+        assert_eq!(unset.unwrap(), ["regolith-sway-gtklock", "-d"]);
+    }
+
+    #[test]
+    fn locker_prefers_wm_program_lock_sway_to_regolith_sway_gtklock() {
+        let args = run_locker(&["wm.program.lock_sway: swaylock -f -c 000000"], true);
+        assert_eq!(args.unwrap(), ["swaylock", "-f", "-c", "000000"]);
     }
 
     #[test]
