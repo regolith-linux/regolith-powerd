@@ -17,7 +17,7 @@ const UPOWER: &str = "org.freedesktop.UPower";
     default_service = "org.freedesktop.UPower",
     default_path = "/org/freedesktop/UPower"
 )]
-trait UPowerSource {
+pub trait UPowerSource {
     #[dbus_proxy(property)]
     fn on_battery(&self) -> zbus::Result<bool>;
 }

@@ -1,0 +1,13 @@
+[Unit]
+Description=Regolith Power Profiles
+PartOf=graphical-session.target
+StartLimitIntervalSec=10
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/regolith-powerd --power-profiles-only
+Restart=on-failure
+
+[Install]
+WantedBy=regolith-x11.target

@@ -17,6 +17,7 @@ mod logind;
 mod monitor_labels;
 mod power_source;
 mod profiles;
+mod remembered;
 mod screensaver;
 mod session;
 
@@ -1160,6 +1161,16 @@ impl PowerSettings {
     }
 }
 fn main() {
+    // The X11 session runs only the power profiles: gnome-settings-daemon
+    // and gnome-flashback do everything else there, sway does not run.
+    let profiles_only = std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--power-profiles-only");
+    if profiles_only {
+        run_power_profiles_only();
+        return;
+    }
+
     // The lock screen's D-Bus interface, which gnome-flashback provides in
     // the X11 session. It runs in a thread of its own.
     screensaver::start();
@@ -1207,8 +1218,9 @@ fn main() {
     manager.run().expect("Failed to run");
 
     // Hold the power-saver profile while the battery is low, as
-    // gnome-settings-daemon's power plugin does.
-    glib::spawn_future_local(profiles::run_power_saver());
+    // gnome-settings-daemon's power plugin does, and switch to the profile
+    // remembered for the power source.
+    glib::spawn_future_local(profiles::run(true));
 
     // Low-battery notifications, which gnome-settings-daemon's power
     // plugin gives the X11 session.
@@ -1217,6 +1229,17 @@ fn main() {
     app.run();
 
     // Drop the hold guard
+    let _ = ManuallyDrop::into_inner(hold_guard);
+}
+
+/// Switch to the profile remembered for the power source, and nothing else.
+/// gnome-settings-daemon holds the power-saver profile on low battery.
+fn run_power_profiles_only() {
+    let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
+    let hold_guard = ManuallyDrop::new(app.hold());
+    glib::spawn_future_local(profiles::run(false));
+    // The option is the daemon's: GApplication would reject it.
+    app.run_with_args::<&str>(&[]);
     let _ = ManuallyDrop::into_inner(hold_guard);
 }
 
