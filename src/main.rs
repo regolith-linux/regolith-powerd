@@ -5,6 +5,7 @@ use std::{
     cell::Cell,
     error::Error,
     mem::ManuallyDrop,
+    os::unix::process::CommandExt,
     process::{Child, Command},
     rc::Rc,
     time::Duration,
@@ -194,11 +195,17 @@ impl Manager {
                 }
                 let swayidle_args = self.get_swayidle_args();
                 current_args = Some(swayidle_args.clone());
-                let child = Command::new("swayidle")
-                    .arg("-w")
-                    .args(swayidle_args)
-                    .spawn();
-                sway_idle_child = child.ok();
+                let mut command = Command::new("swayidle");
+                command.arg("-w").args(swayidle_args);
+                // SAFETY: the closure only makes system calls, as is
+                // allowed between fork and exec.
+                unsafe {
+                    command.pre_exec(|| {
+                        close_inherited_fds_on_exec();
+                        Ok(())
+                    });
+                }
+                sway_idle_child = command.spawn().ok();
                 g_log!(glib::LogLevel::Info, "Swayidle Reloaded");
             }
         });
@@ -859,6 +866,36 @@ const LOCKER: &str = concat!(
     "exec gtklock -d --background \"$wallpaper\"; fi; ",
     "exec gtklock -d; }"
 );
+
+/// Let a child started by [`Manager::run`] keep only its standard streams.
+///
+/// swayidle is started again whenever the idle settings change, at any
+/// time, while other threads receive file descriptors that are not
+/// close-on-exec, such as the logind inhibitor locks zbus hands over. A
+/// swayidle that inherits one holds the lock after the daemon released it
+/// or exited, which keeps the power key and the lid away from logind. Runs
+/// in the child, between fork and exec, so it only makes system calls.
+fn close_inherited_fds_on_exec() {
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+    // SAFETY: close_range(2) and fcntl(2) only change fd flags.
+    unsafe {
+        if libc::syscall(
+            libc::SYS_close_range,
+            3,
+            libc::c_uint::MAX,
+            CLOSE_RANGE_CLOEXEC,
+        ) != 0
+        {
+            // Kernels before 5.11
+            for fd in 3..1024 {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
+    }
+}
 
 /// Stop a swayidle started by [`Manager::run`] and reap it.
 ///
