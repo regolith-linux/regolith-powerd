@@ -10,7 +10,6 @@ use std::{
     rc::Rc,
     time::Duration,
 };
-use swayipc;
 
 mod battery;
 mod end_session;
@@ -20,6 +19,7 @@ mod power_source;
 mod profiles;
 mod screensaver;
 mod session;
+mod sway_link;
 
 // Removable-media automount and its passphrase prompts.
 mod automount;
@@ -131,10 +131,17 @@ impl Manager {
         let send_reload_event = self.idle.reload.clone();
         let recv_reload_event = self.recv_reload_event.clone();
 
+        // Look for sway in a thread of its own; it binds the power button
+        // on every sway it finds and after every reload, and asks for a
+        // reload whenever sway is found or lost, which starts or stops
+        // swayidle.
+        let tx_cpy = send_reload_event.clone();
+        let link = sway_link::Link::start(self.power_settings.power_button_commands(), move || {
+            request_reload(&tx_cpy)
+        });
+
         // Send initial Reload
         request_reload(&send_reload_event);
-        self.power_settings.handle_power_btn_action_change()?;
-        rebind_power_button_after_reloads();
 
         let send_reload_cb = || {
             let tx_cpy = send_reload_event.clone();
@@ -153,10 +160,11 @@ impl Manager {
             .connect_sleep_inactive_battery_timeout_changed(send_reload_cb());
         self.power_settings
             .connect_sleep_inactive_battery_type_changed(send_reload_cb());
+        // Without sway the binding waits for the next one.
+        let link_cpy = link.clone();
         self.power_settings
-            .connect_power_button_action_changed(|s| {
-                s.handle_power_btn_action_change()
-                    .expect("Failed to set Power button action")
+            .connect_power_button_action_changed(move |s| {
+                link_cpy.set_power_button(s.power_button_commands())
             });
         let send_screensaver_reload_cb = || {
             let tx_cpy = send_reload_event.clone();
@@ -179,6 +187,8 @@ impl Manager {
 
         let mut sway_idle_child: Option<Child> = None;
         let mut current_args: Option<Vec<String>> = None;
+        // The sway the running swayidle belongs to
+        let mut current_sway: Option<sway_link::Compositor> = None;
         glib::spawn_future_local(async move {
             while let Ok(_) = recv_reload_event.recv().await {
                 // Restarting swayidle starts its idle count again, so keep
@@ -187,16 +197,39 @@ impl Manager {
                 let running = sway_idle_child
                     .as_mut()
                     .is_some_and(|c| matches!(c.try_wait(), Ok(None)));
-                if running && current_args.as_ref() == Some(&self.get_swayidle_args()) {
+                if running
+                    && current_sway.is_some()
+                    && current_sway == link.compositor()
+                    && current_args.as_ref() == Some(&self.get_swayidle_args())
+                {
                     continue;
                 }
+                // Also when sway went away: swayidle may have exited with
+                // it, and is reaped here either way.
                 if let Some(mut prev_child) = sway_idle_child.take() {
                     stop_swayidle(&mut prev_child).await;
                 }
+                current_args = None;
+                // Without sway swayidle starts once it is back.
+                current_sway = link.compositor();
+                let Some(sway) = &current_sway else {
+                    continue;
+                };
                 let swayidle_args = self.get_swayidle_args();
                 current_args = Some(swayidle_args.clone());
                 let mut command = Command::new("swayidle");
-                command.arg("-w").args(swayidle_args);
+                command
+                    .arg("-w")
+                    .args(swayidle_args)
+                    .env("SWAYSOCK", &sway.target.socket)
+                    // i3 IPC clients its commands may run (i3-msg, i3ipc)
+                    // prefer I3SOCK to SWAYSOCK, and it can name another
+                    // sway, or none.
+                    .env_remove("I3SOCK");
+                match &sway.target.display {
+                    Some(display) => command.env("WAYLAND_DISPLAY", display),
+                    None => command.env_remove("WAYLAND_DISPLAY"),
+                };
                 // SAFETY: the closure only makes system calls, as is
                 // allowed between fork and exec.
                 unsafe {
@@ -869,12 +902,13 @@ const LOCKER: &str = concat!(
 
 /// Let a child started by [`Manager::run`] keep only its standard streams.
 ///
-/// swayidle is started again whenever the idle settings change, at any
-/// time, while other threads receive file descriptors that are not
-/// close-on-exec, such as the logind inhibitor locks zbus hands over. A
-/// swayidle that inherits one holds the lock after the daemon released it
-/// or exited, which keeps the power key and the lid away from logind. Runs
-/// in the child, between fork and exec, so it only makes system calls.
+/// swayidle is started again whenever the idle settings change or sway
+/// comes back, at any time, while other threads receive file descriptors
+/// that are not close-on-exec, such as the logind inhibitor locks zbus
+/// hands over. A swayidle that inherits one holds the lock after the daemon
+/// released it or exited, which keeps the power key and the lid away from
+/// logind. Runs in the child, between fork and exec, so it only makes
+/// system calls.
 fn close_inherited_fds_on_exec() {
     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
     // SAFETY: close_range(2) and fcntl(2) only change fd flags.
@@ -1056,113 +1090,14 @@ enum KeySymAction {
 
 const POWER_OFF_KEY: &str = "XF86Poweroff";
 
-/// Bind the power button again after every sway reload.
-///
-/// The binding is added over sway IPC, and `swaymsg reload` (Super+Shift+C,
-/// and `regolith-look` after every look change) rebuilds the bindings from
-/// the config files, which drops it. powerd keeps logind's power key
-/// inhibitor, so the button then did nothing at all.
-///
-/// The reload events are read in a thread of their own, as the sway IPC
-/// client blocks; the binding is set on the main context, where the
-/// settings live.
-fn rebind_power_button_after_reloads() {
-    let (send_reload, recv_reload) = async_channel::unbounded();
-    std::thread::spawn(move || {
-        let result = swayipc::Connection::new().and_then(|conn| {
-            watch_sway_reloads(conn, || {
-                let _ = send_reload.try_send(());
-            })
-        });
-        if let Err(e) = result {
-            g_log!(
-                glib::LogLevel::Warning,
-                "Stopped following sway reloads: {e}"
-            );
-        }
-    });
-    glib::spawn_future_local(async move {
-        let power_settings = PowerSettings::new();
-        while recv_reload.recv().await.is_ok() {
-            if let Err(e) = power_settings.handle_power_btn_action_change() {
-                g_log!(
-                    glib::LogLevel::Warning,
-                    "Cannot bind the power button after a sway reload: {e}"
-                );
-            }
-        }
-    });
-}
-
-/// Call `on_reload` after every sway config reload (the workspace event
-/// with change `reload`, sent once the new config is in place), until the
-/// connection to sway ends.
-fn watch_sway_reloads(
-    conn: swayipc::Connection,
-    mut on_reload: impl FnMut(),
-) -> swayipc::Fallible<()> {
-    for event in conn.subscribe([swayipc::EventType::Workspace])? {
-        if let swayipc::Event::Workspace(workspace) = event? {
-            if workspace.change == swayipc::WorkspaceChange::Reload {
-                on_reload();
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod sway_reload_tests {
-    use super::watch_sway_reloads;
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-
-    /// A sway IPC message: magic, payload length, type, payload.
-    fn ipc_message(kind: u32, payload: &str) -> Vec<u8> {
-        let mut msg = b"i3-ipc".to_vec();
-        msg.extend((payload.len() as u32).to_ne_bytes());
-        msg.extend(kind.to_ne_bytes());
-        msg.extend(payload.as_bytes());
-        msg
-    }
-
-    #[test]
-    fn follows_sway_reloads_until_sway_goes_away() {
-        let (client, mut server) = UnixStream::pair().unwrap();
-        let fake_sway = std::thread::spawn(move || {
-            let mut header = [0u8; 14];
-            server.read_exact(&mut header).unwrap();
-            assert_eq!(&header[..6], b"i3-ipc");
-            let len = u32::from_ne_bytes(header[6..10].try_into().unwrap());
-            let kind = u32::from_ne_bytes(header[10..14].try_into().unwrap());
-            let mut payload = vec![0u8; len as usize];
-            server.read_exact(&mut payload).unwrap();
-            assert_eq!(kind, 2, "SUBSCRIBE");
-            assert_eq!(String::from_utf8(payload).unwrap(), r#"["workspace"]"#);
-            server
-                .write_all(&ipc_message(2, r#"{"success":true}"#))
-                .unwrap();
-            // Workspace events; only "reload" counts.
-            for change in ["reload", "init", "empty", "reload"] {
-                let event = format!(r#"{{"change":"{change}","current":null,"old":null}}"#);
-                server.write_all(&ipc_message(0x8000_0000, &event)).unwrap();
-            }
-            // Dropping the socket stands for sway exiting.
-        });
-        let mut reloads = 0;
-        let result = watch_sway_reloads(swayipc::Connection::from(client), || reloads += 1);
-        fake_sway.join().unwrap();
-        assert_eq!(reloads, 2);
-        assert!(result.is_err());
-    }
-}
-
 impl PowerSettings {
+    /// The sway commands that bind the power button for the power-button
+    /// setting: the old binding goes, and the key is bound to the action,
+    /// unless that is to do nothing. [`sway_link`] runs them.
     // Requires settings HandlePowerKey=ignore in logind.conf
-    fn handle_power_btn_action_change(&self) -> Result<(), Box<dyn Error>> {
-        use PowerButtonAction::*;
-        let mut sway_conn = swayipc::Connection::new()?;
+    fn power_button_commands(&self) -> Vec<String> {
         use KeySymAction::*;
+        use PowerButtonAction::*;
         let btn_change_action = match self.power_button_action() {
             Nothing => Unbind {
                 key: POWER_OFF_KEY.to_string(),
@@ -1183,17 +1118,15 @@ impl PowerSettings {
         };
 
         match btn_change_action {
-            Unbind { ref key } => sway_conn.run_command(format!("unbindsym {key}"))?,
+            Unbind { ref key } => vec![format!("unbindsym {key}")],
             ReBind {
                 ref key,
                 ref action,
-            } => {
-                let _ = sway_conn.run_command(format!("unbindsym {key}"));
-                sway_conn.run_command(format!("bindsym {key} exec \"{action}\""))?
-            }
-        };
-
-        Ok(())
+            } => vec![
+                format!("unbindsym {key}"),
+                format!("bindsym {key} exec \"{action}\""),
+            ],
+        }
     }
 }
 fn main() {

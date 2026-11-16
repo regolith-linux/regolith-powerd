@@ -17,8 +17,8 @@ pub trait Logind {
 }
 
 /// Keep an inhibitor fd out of the programs this daemon starts (swayidle,
-/// which is started again whenever the idle settings change, and the
-/// commands it runs). A copy there would hold the lock after the daemon released it, or
+/// which is started again whenever the idle settings change or sway comes
+/// back, and the commands it runs). A copy there would hold the lock after the daemon released it, or
 /// after the daemon exited.
 fn close_on_exec(fd: OwnedFd) -> OwnedFd {
     let raw = fd.as_raw_fd();
