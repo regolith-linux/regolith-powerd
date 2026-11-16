@@ -1,5 +1,6 @@
 //! systemd-logind inhibitor locks taken by this daemon.
 
+use std::os::fd::AsRawFd;
 use zbus::zvariant::OwnedFd;
 use zbus::{dbus_proxy, Result};
 
@@ -15,6 +16,23 @@ pub trait Logind {
     fn Inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<OwnedFd>;
 }
 
+/// Keep an inhibitor fd out of the programs this daemon starts (swayidle,
+/// which is started again whenever the idle settings change or sway comes
+/// back, and the commands it runs). A copy there would hold the lock after the daemon released it, or
+/// after the daemon exited.
+fn close_on_exec(fd: OwnedFd) -> OwnedFd {
+    let raw = fd.as_raw_fd();
+    // SAFETY: fcntl(2) on an fd this function owns; F_GETFD/F_SETFD only
+    // read and set its flags.
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+    fd
+}
+
 pub async fn setup_logind_inhibits() -> Result<OwnedFd> {
     let connection = zbus::Connection::system().await?;
     let proxy = LogindProxy::new(&connection).await?;
@@ -26,6 +44,7 @@ pub async fn setup_logind_inhibits() -> Result<OwnedFd> {
             "block",
         )
         .await
+        .map(close_on_exec)
 }
 
 /// One named logind inhibitor lock slot. The lock is held while the slot
@@ -53,11 +72,11 @@ impl Lock {
         if !wanted {
             self.fd = None;
         } else if self.fd.is_none() {
-            self.fd = Some(
+            self.fd = Some(close_on_exec(
                 proxy
                     .Inhibit(self.what, WHO, "GNOME session inhibition", self.mode)
                     .await?,
-            );
+            ));
         }
         Ok(())
     }
