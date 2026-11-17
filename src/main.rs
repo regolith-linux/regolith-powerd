@@ -5,9 +5,9 @@ use std::{
     cell::Cell,
     error::Error,
     mem::ManuallyDrop,
-    process::{Child, Command},
+    process::{Child, Command, ExitStatus},
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use swayipc;
 
@@ -176,32 +176,11 @@ impl Manager {
         self.session_settings
             .connect_idle_delay_changed(move |_| request_reload(&send_reload_event));
 
-        let mut sway_idle_child: Option<Child> = None;
-        let mut current_args: Option<Vec<String>> = None;
-        glib::spawn_future_local(async move {
-            while let Ok(_) = recv_reload_event.recv().await {
-                // Restarting swayidle starts its idle count again, so keep
-                // the running one when nothing it runs has changed (for
-                // example a power-source change with the same action).
-                let running = sway_idle_child
-                    .as_mut()
-                    .is_some_and(|c| matches!(c.try_wait(), Ok(None)));
-                if running && current_args.as_ref() == Some(&self.get_swayidle_args()) {
-                    continue;
-                }
-                if let Some(mut prev_child) = sway_idle_child.take() {
-                    stop_swayidle(&mut prev_child).await;
-                }
-                let swayidle_args = self.get_swayidle_args();
-                current_args = Some(swayidle_args.clone());
-                let child = Command::new("swayidle")
-                    .arg("-w")
-                    .args(swayidle_args)
-                    .spawn();
-                sway_idle_child = child.ok();
-                g_log!(glib::LogLevel::Info, "Swayidle Reloaded");
-            }
-        });
+        supervise_swayidle(
+            recv_reload_event,
+            || Command::new("swayidle"),
+            move || self.get_swayidle_args(),
+        );
 
         Ok(())
     }
@@ -860,7 +839,7 @@ const LOCKER: &str = concat!(
     "exec gtklock -d; }"
 );
 
-/// Stop a swayidle started by [`Manager::run`] and reap it.
+/// Stop a swayidle started by [`supervise_swayidle`] and reap it.
 ///
 /// On SIGTERM swayidle runs the resume command of every timeout that has
 /// fired, which restores the brightness and turns the outputs back on, and
@@ -888,6 +867,512 @@ async fn stop_swayidle(child: &mut Child) {
         .kill()
         .unwrap_or_else(|e| println!("Cannot kill swayidle: {e}"));
     let _ = child.wait();
+}
+
+/// How long swayidle has to stay up for its ending not to count as a
+/// failed attempt.
+const SWAYIDLE_MIN_UPTIME: Duration = Duration::from_secs(10);
+
+/// The wait before starting swayidle again after `failures` failed attempts
+/// in a row, a failed attempt being a start that failed or a swayidle that
+/// ended within [`SWAYIDLE_MIN_UPTIME`]: none after one, then 1, 2, 4, 8 and
+/// 16 seconds, and 30 seconds from the seventh on. There is no last attempt.
+fn swayidle_restart_delay(failures: u32) -> Duration {
+    match failures {
+        0 | 1 => Duration::ZERO,
+        2..=6 => Duration::from_secs(1 << (failures - 2)),
+        _ => Duration::from_secs(30),
+    }
+}
+
+/// How a swayidle ended, for the warning that reports it.
+fn describe_swayidle_ending(status: ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        format!("exited with status {code}")
+    } else if let Some(signal) = status.signal() {
+        let core = if status.core_dumped() {
+            " (core dumped)"
+        } else {
+            ""
+        };
+        format!("was killed by signal {signal}{core}")
+    } else {
+        format!("ended: {status}")
+    }
+}
+
+/// Keep one swayidle running with the arguments of the current settings,
+/// as the X11 session's services are kept running.
+///
+/// swayidle is started after each message on `reloads`, unless the running
+/// one already has the arguments `args` gives, as `command` with `-w` and
+/// those arguments. A swayidle that ends on its own, however it ends, is
+/// reaped, reported and started again, and so is a start that fails; failed
+/// attempts in a row space the starts out as [`swayidle_restart_delay`]
+/// says. A reload during such a wait starts swayidle at once and clears the
+/// count.
+fn supervise_swayidle(
+    reloads: async_channel::Receiver<()>,
+    command: impl Fn() -> Command + 'static,
+    args: impl Fn() -> Vec<String> + 'static,
+) {
+    // Reloads, swayidle's endings and the ends of the waits before
+    // restarting it all go through one queue, so that they are handled one
+    // at a time and in order.
+    let (send_event, recv_event) = async_channel::unbounded();
+    let send_reload = send_event.clone();
+    glib::spawn_future_local(async move {
+        while reloads.recv().await.is_ok() {
+            if send_reload.send(SwayidleEvent::Reload).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut swayidle = Swayidle {
+        events: send_event,
+        command: Box::new(command),
+        args: Box::new(args),
+        running: None,
+        failures: 0,
+        retry: None,
+        last_id: 0,
+    };
+    glib::spawn_future_local(async move {
+        while let Ok(event) = recv_event.recv().await {
+            swayidle.handle(event).await;
+        }
+    });
+}
+
+/// What [`Swayidle`] acts on.
+#[derive(Debug)]
+enum SwayidleEvent {
+    /// The settings or the idle context changed.
+    Reload,
+    /// The swayidle of this start has ended; it is still to be reaped.
+    Ended(u64),
+    /// The wait with this number before the next start is over.
+    Retry(u64),
+}
+
+/// A swayidle that [`Swayidle`] started.
+struct SwayidleProcess {
+    child: Child,
+    /// Tells the process's [`SwayidleEvent::Ended`] from a former one's.
+    id: u64,
+    args: Vec<String>,
+    started: Instant,
+}
+
+/// The state of [`supervise_swayidle`].
+struct Swayidle {
+    events: async_channel::Sender<SwayidleEvent>,
+    command: Box<dyn Fn() -> Command>,
+    args: Box<dyn Fn() -> Vec<String>>,
+    running: Option<SwayidleProcess>,
+    /// Failed attempts in a row.
+    failures: u32,
+    /// The number of the wait before the next start, while there is one.
+    /// A wait that is given up still ends, but is then ignored.
+    retry: Option<u64>,
+    last_id: u64,
+}
+
+impl Swayidle {
+    async fn handle(&mut self, event: SwayidleEvent) {
+        match event {
+            SwayidleEvent::Reload => self.reload().await,
+            SwayidleEvent::Ended(id) => {
+                if self.running.as_ref().is_some_and(|p| p.id == id) && !self.is_running() {
+                    self.start_after(swayidle_restart_delay(self.failures));
+                }
+            }
+            SwayidleEvent::Retry(id) => {
+                if self.retry == Some(id) {
+                    self.retry = None;
+                    self.start();
+                }
+            }
+        }
+    }
+
+    async fn reload(&mut self) {
+        if self.is_running() {
+            // Restarting swayidle starts its idle count again, so keep the
+            // running one when nothing it runs has changed (for example a
+            // power-source change with the same action).
+            let args = (self.args)();
+            let mut process = self.running.take().unwrap();
+            if process.args == args {
+                self.running = Some(process);
+                return;
+            }
+            stop_swayidle(&mut process.child).await;
+        }
+        // New settings: start afresh, without waiting out failures that
+        // happened under the old ones.
+        self.retry = None;
+        self.failures = 0;
+        self.start();
+    }
+
+    /// Whether swayidle is running. If it has ended, it is reaped, its
+    /// ending is reported and counted, and it is forgotten.
+    fn is_running(&mut self) -> bool {
+        let Some(process) = self.running.as_mut() else {
+            return false;
+        };
+        let ending = match process.child.try_wait() {
+            Ok(None) => return true,
+            Ok(Some(status)) => describe_swayidle_ending(status),
+            Err(e) => format!("cannot be waited for: {e}"),
+        };
+        let process = self.running.take().unwrap();
+        g_log!(
+            glib::LogLevel::Warning,
+            "swayidle (pid {}) {ending}",
+            process.child.id()
+        );
+        if process.started.elapsed() < SWAYIDLE_MIN_UPTIME {
+            self.failures = self.failures.saturating_add(1);
+        } else {
+            self.failures = 0;
+        }
+        false
+    }
+
+    fn start_after(&mut self, delay: Duration) {
+        if delay.is_zero() {
+            self.start();
+            return;
+        }
+        self.last_id += 1;
+        let id = self.last_id;
+        self.retry = Some(id);
+        let events = self.events.clone();
+        glib::spawn_future_local(async move {
+            glib::timeout_future(delay).await;
+            let _ = events.send(SwayidleEvent::Retry(id)).await;
+        });
+    }
+
+    /// Start swayidle with the current settings, looking it up in `PATH`
+    /// each time, or arrange to try again if it cannot be started.
+    fn start(&mut self) {
+        loop {
+            let args = (self.args)();
+            match (self.command)().arg("-w").args(&args).spawn() {
+                Ok(child) => {
+                    self.last_id += 1;
+                    let process = SwayidleProcess {
+                        child,
+                        id: self.last_id,
+                        args,
+                        started: Instant::now(),
+                    };
+                    watch_swayidle(&process, self.events.clone());
+                    self.running = Some(process);
+                    g_log!(glib::LogLevel::Info, "Swayidle Reloaded");
+                    return;
+                }
+                Err(e) => {
+                    g_log!(glib::LogLevel::Warning, "Cannot start swayidle: {e}");
+                    self.failures = self.failures.saturating_add(1);
+                    let delay = swayidle_restart_delay(self.failures);
+                    if !delay.is_zero() {
+                        self.start_after(delay);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Send [`SwayidleEvent::Ended`] once `process` has ended.
+///
+/// The process is not reaped here but by its [`Child`], so its pid stays
+/// taken until then, and [`stop_swayidle`] cannot signal another process
+/// by mistake. The wait blocks, so it runs in a thread of its own, which
+/// ends with the process.
+fn watch_swayidle(process: &SwayidleProcess, events: async_channel::Sender<SwayidleEvent>) {
+    let pid = process.child.id();
+    let id = process.id;
+    let watch = move || {
+        // SAFETY: waitid(2) only writes to the siginfo_t it is given.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        while unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        } != 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {}
+        // On any other error the process is gone already; it is looked at
+        // either way.
+        let _ = events.try_send(SwayidleEvent::Ended(id));
+    };
+    if let Err(e) = std::thread::Builder::new()
+        .name("swayidle-watch".into())
+        .spawn(watch)
+    {
+        g_log!(
+            glib::LogLevel::Warning,
+            "Cannot watch swayidle (pid {pid}): {e}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod swayidle_tests {
+    use super::{describe_swayidle_ending, supervise_swayidle, swayidle_restart_delay};
+    use std::{
+        cell::RefCell,
+        fs,
+        os::unix::{
+            fs::{symlink, PermissionsExt},
+            process::ExitStatusExt,
+        },
+        path::PathBuf,
+        process::{Command, ExitStatus},
+        rc::Rc,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn swayidle_restarts_back_off_up_to_thirty_seconds() {
+        let delays: Vec<u64> = (0..10)
+            .map(|failures| swayidle_restart_delay(failures).as_secs())
+            .collect();
+        assert_eq!(delays, [0, 0, 1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(swayidle_restart_delay(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn swayidle_endings_give_the_status_or_the_signal() {
+        let describe = |raw| describe_swayidle_ending(ExitStatus::from_raw(raw));
+        assert_eq!(describe(0), "exited with status 0");
+        assert_eq!(describe(255 << 8), "exited with status 255");
+        assert_eq!(describe(libc::SIGKILL), "was killed by signal 9");
+        assert_eq!(
+            describe(libc::SIGSEGV | 0x80),
+            "was killed by signal 11 (core dumped)"
+        );
+    }
+
+    /// A stand-in for swayidle in a directory of its own. Each start
+    /// appends a line with its arguments to `starts` and one with the time
+    /// it ended to `ends`. It ends after `life`, on SIGTERM, or when the
+    /// test is over.
+    struct FakeSwayidle {
+        dir: PathBuf,
+        script: PathBuf,
+    }
+
+    impl FakeSwayidle {
+        fn new(name: &str, life: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "regolith-powerd-test-{}-swayidle-{name}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("swayidle");
+            fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n\
+                     cd '{}'\n\
+                     echo \"$*\" >> starts\n\
+                     trap 'echo term >> ends; exit 0' TERM\n\
+                     n=0\n\
+                     while [ ! -e over ] && [ \"$n\" -lt {life} ]; do sleep 0.05; n=$((n + 1)); done\n\
+                     echo end >> ends\n",
+                    dir.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            Self { dir, script }
+        }
+
+        /// Run the script through sh: a fork in another test thread can
+        /// still hold a file just written open for writing, and exec would
+        /// then fail with ETXTBSY.
+        fn command(&self) -> impl Fn() -> Command + 'static {
+            let script = self.script.clone();
+            move || {
+                let mut command = Command::new("sh");
+                command.arg(&script);
+                command
+            }
+        }
+
+        fn lines(&self, file: &str) -> Vec<String> {
+            fs::read_to_string(self.dir.join(file))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn starts(&self) -> Vec<String> {
+            self.lines("starts")
+        }
+    }
+
+    impl Drop for FakeSwayidle {
+        fn drop(&mut self) {
+            let _ = fs::write(self.dir.join("over"), "");
+        }
+    }
+
+    /// Wait on the thread-default main context until `done` holds, and
+    /// return when it first did.
+    async fn wait_until(what: &str, timeout: Duration, done: impl Fn() -> bool) -> Instant {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < timeout, "timed out waiting for {what}");
+            glib::timeout_future(Duration::from_millis(20)).await;
+        }
+        Instant::now()
+    }
+
+    #[test]
+    fn swayidle_that_ends_is_started_again_with_the_same_arguments() {
+        // Up for 0.2 s each time: every ending is a failed attempt.
+        let fake = FakeSwayidle::new("respawn", "4");
+        let (reloads, recv_reloads) = async_channel::bounded(1);
+        glib::MainContext::new().block_on(async {
+            reloads.send(()).await.unwrap();
+            supervise_swayidle(recv_reloads, fake.command(), || {
+                vec!["timeout".into(), "300".into(), "echo idle".into()]
+            });
+            let second = wait_until("the second start", Duration::from_secs(5), || {
+                fake.starts().len() >= 2
+            })
+            .await;
+            let third = wait_until("the third start", Duration::from_secs(5), || {
+                fake.starts().len() >= 3
+            })
+            .await;
+            // The second follows the first ending at once, the third one
+            // second after the second ending.
+            let gap = third - second;
+            assert!(gap >= Duration::from_millis(1100), "{gap:?}");
+            assert!(gap < Duration::from_millis(2500), "{gap:?}");
+        });
+        let starts = fake.starts();
+        assert!(starts.len() >= 3, "{starts:?}");
+        assert!(
+            starts.iter().all(|s| s == "-w timeout 300 echo idle"),
+            "{starts:?}"
+        );
+    }
+
+    #[test]
+    fn swayidle_stopped_for_new_settings_is_replaced_once() {
+        // Stays up until it is stopped.
+        let fake = FakeSwayidle::new("new-settings", "100000");
+        let timeout = Rc::new(RefCell::new("300".to_owned()));
+        let (reloads, recv_reloads) = async_channel::bounded(1);
+        let args = timeout.clone();
+        glib::MainContext::new().block_on(async {
+            reloads.send(()).await.unwrap();
+            supervise_swayidle(recv_reloads, fake.command(), move || {
+                vec!["timeout".into(), args.borrow().clone(), "echo idle".into()]
+            });
+            wait_until("the first start", Duration::from_secs(5), || {
+                fake.starts().len() == 1
+            })
+            .await;
+            // Unchanged settings leave it running.
+            reloads.send(()).await.unwrap();
+            glib::timeout_future(Duration::from_millis(500)).await;
+            assert_eq!(fake.starts().len(), 1);
+            *timeout.borrow_mut() = "600".to_owned();
+            reloads.send(()).await.unwrap();
+            wait_until("the replacement", Duration::from_secs(5), || {
+                fake.starts().len() == 2
+            })
+            .await;
+            glib::timeout_future(Duration::from_millis(1500)).await;
+        });
+        assert_eq!(
+            fake.starts(),
+            ["-w timeout 300 echo idle", "-w timeout 600 echo idle"]
+        );
+        assert_eq!(fake.lines("ends"), ["term"]);
+    }
+
+    #[test]
+    fn a_reload_while_waiting_to_restart_swayidle_starts_it_at_once() {
+        // Ends at once: after four starts the next one is 4 s away.
+        let fake = FakeSwayidle::new("reload-in-wait", "0");
+        let timeout = Rc::new(RefCell::new("300".to_owned()));
+        let (reloads, recv_reloads) = async_channel::bounded(1);
+        let args = timeout.clone();
+        glib::MainContext::new().block_on(async {
+            reloads.send(()).await.unwrap();
+            supervise_swayidle(recv_reloads, fake.command(), move || {
+                vec!["timeout".into(), args.borrow().clone(), "echo idle".into()]
+            });
+            wait_until("four starts", Duration::from_secs(10), || {
+                fake.starts().len() == 4 && fake.lines("ends").len() == 4
+            })
+            .await;
+            // Without the reload the fifth start would come 4 s after the
+            // fourth ending.
+            glib::timeout_future(Duration::from_millis(300)).await;
+            *timeout.borrow_mut() = "600".to_owned();
+            reloads.send(()).await.unwrap();
+            let reload = Instant::now();
+            wait_until("the start after the reload", Duration::from_secs(1), || {
+                fake.starts().len() >= 5
+            })
+            .await;
+            // The count was cleared: the next start follows the fifth ending
+            // at once, the one after it comes 1 s later and the next 2 s
+            // after that. The cancelled start, 3.7 s after the reload, never
+            // comes.
+            let now = wait_until("4.5 s after the reload", Duration::from_secs(5), || {
+                reload.elapsed() >= Duration::from_millis(4500)
+            })
+            .await;
+            assert_eq!(fake.starts().len(), 8, "{:?}", now - reload);
+        });
+        let starts = fake.starts();
+        assert!(starts[..4].iter().all(|s| s == "-w timeout 300 echo idle"));
+        assert!(starts[4..].iter().all(|s| s == "-w timeout 600 echo idle"));
+    }
+
+    #[test]
+    fn swayidle_that_cannot_be_started_is_tried_again() {
+        let fake = FakeSwayidle::new("missing", "100000");
+        let program = fake.dir.join("bin").join("swayidle");
+        let (reloads, recv_reloads) = async_channel::bounded(1);
+        let path = program.clone();
+        glib::MainContext::new().block_on(async {
+            reloads.send(()).await.unwrap();
+            // The program is looked up again for each attempt.
+            supervise_swayidle(recv_reloads, move || Command::new(&path), Vec::new);
+            // It failed at once and at once again; the next tries are at
+            // 1 s and 3 s.
+            glib::timeout_future(Duration::from_millis(1500)).await;
+            assert!(fake.starts().is_empty());
+            fs::create_dir(program.parent().unwrap()).unwrap();
+            symlink(&fake.script, &program).unwrap();
+            wait_until("the start once it is there", Duration::from_secs(3), || {
+                !fake.starts().is_empty()
+            })
+            .await;
+        });
+        assert_eq!(fake.starts(), ["-w"]);
+    }
 }
 
 /// A sleep-inactive timeout for swayidle: after `timeout` seconds idle run
