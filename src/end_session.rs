@@ -18,6 +18,8 @@
 //! that the session's logout, reboot and shutdown keybindings show:
 //!
 //! - the button confirms, and closing the bar cancels;
+//! - when swaynag supports it (`--keyboard-control`), the bar takes the
+//!   keyboard as the X11 dialog does: Return confirms and Escape cancels;
 //! - when nothing inhibits logging out, the action is taken once the time
 //!   gnome-session gives (60 seconds) is up, as gnome-flashback's dialog
 //!   does;
@@ -146,6 +148,19 @@ fn prompt_args(
         })
         .collect();
     (args, Some(details))
+}
+
+/// Whether the prompt takes `--keyboard-control yes`, which lets it be
+/// answered from the keyboard. Only sway-regolith's swaynag has it, and a
+/// swaynag given an option it does not know shows nothing, so its help is
+/// checked first.
+fn supports_keyboard_control(prompt: &Path) -> bool {
+    Command::new(prompt)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("--keyboard-control"))
 }
 
 /// Whether a `gnome-session-quit` of `uid` that asked for `action` without a
@@ -402,7 +417,11 @@ impl Dialog {
                 .round() as u32
         });
         let (args, details) = prompt_args(action, &inhibitors, left);
-        let spawned = Command::new(&self.config.prompt)
+        let mut command = Command::new(&self.config.prompt);
+        if supports_keyboard_control(&self.config.prompt) {
+            command.args(["--keyboard-control", "yes"]);
+        }
+        let spawned = command
             .args(&args)
             .stdin(if details.is_some() {
                 Stdio::piped()
@@ -620,6 +639,29 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn asks_for_keyboard_control_only_where_supported() {
+        let dir = std::env::temp_dir().join(format!("powerd-esd-kbd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let prompt = |name: &str, help: &str| {
+            let path = dir.join(name);
+            fs::write(&path, format!("#!/bin/sh\nprintf '{help}'\nexit 1\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // sway-regolith's swaynag, and one without the option
+        let patched = prompt(
+            "patched",
+            "  -v, --version  Show the version.\\n  --keyboard-control yes|no  Take the keyboard.\\n",
+        );
+        let stock = prompt("stock", "  -v, --version  Show the version.\\n");
+        assert!(supports_keyboard_control(&patched));
+        assert!(!supports_keyboard_control(&stock));
+        assert!(!supports_keyboard_control(&dir.join("missing")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn fake_process(root: &Path, pid: &str, argv: &[&str]) {
         let dir = root.join(pid);
         fs::create_dir_all(&dir).unwrap();
@@ -724,8 +766,9 @@ pub(crate) mod tests {
     /// A stand-in for swaynag. It records its arguments and details, then
     /// does what the file `mode` next to it says: `confirm` presses the
     /// button (runs its command, as swaynag does), `dismiss` closes the bar,
-    /// anything else stays until killed.
+    /// anything else stays until killed. Its help lists `--keyboard-control`.
     const FAKE_PROMPT: &str = r#"#!/bin/sh
+[ "$1" = --help ] && { echo '  --keyboard-control yes|no'; exit 1; }
 dir=$(dirname "$0")
 n=$(ls "$dir" | grep -c '^args\.')
 printf '%s\n' "$@" > "$dir/args.$n"
@@ -869,6 +912,7 @@ esac
         open(2, 60, &["/org/gnome/SessionManager/Inhibitor2"]).unwrap();
         expect(&["ConfirmedReboot", "Closed"]);
         let args = read("args.0".into());
+        assert!(args.starts_with("--keyboard-control\nyes\n-t\n"), "{args}");
         assert!(args.contains("-Z\nReboot\necho confirmed\n"), "{args}");
         assert!(
             args.contains("restart automatically in 60 seconds"),
