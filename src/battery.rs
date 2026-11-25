@@ -6,16 +6,24 @@
 //! its composite display device from the thresholds in UPower.conf: entering
 //! the low, critical or action level shows one notification, which is closed
 //! when the level drops back to none (on AC power or charged).
+//!
+//! The batteries of wireless devices are followed in [`crate::devices`].
 
 use glib::g_log;
 use std::collections::HashMap;
-use zbus::export::futures_util::{stream, StreamExt};
+use std::pin::Pin;
+use zbus::export::futures_util::stream::{self, Stream};
+use zbus::export::futures_util::StreamExt;
+use zbus::export::ordered_stream::{self, OrderedStreamExt};
+use zbus::fdo::DBusProxy;
+use zbus::names::WellKnownName;
 use zbus::zvariant::Value;
 use zbus::{dbus_proxy, Connection};
 
-const APP_NAME: &str = "Power";
+pub(crate) const APP_NAME: &str = "Power";
 const LOW_TIMEOUT_MS: i32 = 30_000;
 const RETRY_SECS: u32 = 60;
+const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
 
 // UPower's UpDeviceKind values for the display device.
 const KIND_UPS: u32 = 3;
@@ -25,8 +33,13 @@ const KIND_UPS: u32 = 3;
     default_service = "org.freedesktop.UPower",
     default_path = "/org/freedesktop/UPower"
 )]
-trait UPower {
+pub(crate) trait UPower {
     fn get_critical_action(&self) -> zbus::Result<String>;
+    fn enumerate_devices(&self) -> zbus::Result<Vec<zbus::zvariant::OwnedObjectPath>>;
+    #[dbus_proxy(signal)]
+    fn device_added(&self, device: zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
+    #[dbus_proxy(signal)]
+    fn device_removed(&self, device: zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
 }
 
 #[dbus_proxy(
@@ -48,7 +61,7 @@ trait Device {
     default_service = "org.freedesktop.Notifications",
     default_path = "/org/freedesktop/Notifications"
 )]
-trait Notifications {
+pub(crate) trait Notifications {
     #[allow(clippy::too_many_arguments)]
     fn notify(
         &self,
@@ -62,6 +75,54 @@ trait Notifications {
         expire_timeout: i32,
     ) -> zbus::Result<u32>;
     fn close_notification(&self, id: u32) -> zbus::Result<()>;
+    #[dbus_proxy(signal)]
+    fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
+}
+
+/// What the notification service tells a source of warnings.
+#[derive(Debug)]
+pub(crate) enum ServiceEvent {
+    /// `org.freedesktop.Notifications` has a new owner, or (`None`) none.
+    Owner(Option<String>),
+    /// The current owner closed one of its notifications by itself: it
+    /// expired or the user dismissed it. The id is dead from now on.
+    Closed(u32),
+}
+
+/// Who owns the notification service right now, and the changes to come,
+/// in the order the bus delivered them. Subscribed before asking, so no
+/// change slips through.
+pub(crate) async fn service_events(
+    session: &Connection,
+) -> zbus::Result<(Option<String>, Pin<Box<dyn Stream<Item = ServiceEvent>>>)> {
+    let dbus = DBusProxy::new(session).await?;
+    let owners = OrderedStreamExt::filter_map(
+        dbus.receive_name_owner_changed_with_args(&[(0, NOTIFICATIONS)])
+            .await?,
+        |signal| {
+            let args = signal.args().ok()?;
+            let owner = args.new_owner().as_ref().map(|owner| owner.to_string());
+            Some(ServiceEvent::Owner(owner))
+        },
+    );
+    // zbus follows the owner of the well-known name: only the current
+    // instance's signals come through.
+    let closed = OrderedStreamExt::filter_map(
+        NotificationsProxy::new(session)
+            .await?
+            .receive_notification_closed()
+            .await?,
+        |signal| Some(ServiceEvent::Closed(signal.args().ok()?.id)),
+    );
+    let owner = dbus
+        .get_name_owner(WellKnownName::from_static_str_unchecked(NOTIFICATIONS).into())
+        .await
+        .ok()
+        .map(|owner| owner.to_string());
+    Ok((
+        owner,
+        Box::pin(ordered_stream::join(owners, closed).into_stream()),
+    ))
 }
 
 /// UPower's `WarningLevel`, reduced to the levels that warn on battery.
@@ -92,8 +153,45 @@ pub struct Warning {
     pub icon: &'static str,
     /// Notification urgency: 1 normal, 2 critical.
     pub urgency: u8,
+    /// Whether the notification is transient (not kept by the server).
+    pub transient: bool,
     /// Expiry in milliseconds, 0 for never.
     pub timeout_ms: i32,
+}
+
+impl Warning {
+    /// A low warning: it expires and is not kept.
+    pub(crate) fn low(summary: String, body: String) -> Warning {
+        Warning {
+            summary,
+            body,
+            icon: "battery-low-symbolic",
+            urgency: 1,
+            transient: true,
+            timeout_ms: LOW_TIMEOUT_MS,
+        }
+    }
+
+    /// A critical warning: it stays until it is closed.
+    pub(crate) fn critical(summary: String, body: String) -> Warning {
+        Warning {
+            summary,
+            body,
+            icon: "battery-caution-symbolic",
+            urgency: 2,
+            transient: false,
+            timeout_ms: 0,
+        }
+    }
+
+    /// The notification hints for this warning.
+    pub(crate) fn hints(&self) -> HashMap<&'static str, Value<'static>> {
+        let mut hints = HashMap::from([("urgency", Value::U8(self.urgency))]);
+        if self.transient {
+            hints.insert("transient", Value::Bool(true));
+        }
+        hints
+    }
 }
 
 /// The notification for a level, with the texts gnome-settings-daemon uses,
@@ -153,6 +251,7 @@ pub fn warning(level: Level, kind: u32, percentage: f64, critical_action: &str) 
         body,
         icon,
         urgency,
+        transient: level == Level::Low,
         timeout_ms,
     })
 }
@@ -188,10 +287,6 @@ impl Tracker {
         let Some(warning) = warning(level, kind, percentage, &action) else {
             return;
         };
-        let mut hints = HashMap::from([("urgency", Value::U8(warning.urgency))]);
-        if level == Level::Low {
-            hints.insert("transient", Value::Bool(true));
-        }
         match notifications
             .notify(
                 APP_NAME,
@@ -200,7 +295,7 @@ impl Tracker {
                 &warning.summary,
                 &warning.body,
                 &[],
-                hints,
+                warning.hints(),
                 warning.timeout_ms,
             )
             .await
@@ -263,10 +358,11 @@ pub async fn run_warnings() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
@@ -371,7 +467,7 @@ mod tests {
         }
     }
 
-    struct Bus(Child);
+    pub(crate) struct Bus(Child);
 
     impl Drop for Bus {
         fn drop(&mut self) {
@@ -381,9 +477,38 @@ mod tests {
     }
 
     /// A private bus that stands in for both the system and session bus.
-    fn private_bus() -> (Bus, String) {
+    /// It has no service directories: a notification daemon installed on
+    /// the machine must not be started in place of a missing fake one.
+    pub(crate) fn private_bus() -> (Bus, String) {
+        static BUSES: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir();
+        let config = dir.join(format!(
+            "regolith-powerd-test-bus-{}-{}.conf",
+            std::process::id(),
+            BUSES.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &config,
+            format!(
+                r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir={}</listen>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
         let mut child = Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--print-address=1"])
+            .arg(format!("--config-file={}", config.display()))
+            .args(["--nofork", "--print-address=1"])
             .stdout(Stdio::piped())
             .spawn()
             .expect("dbus-daemon is needed to run this test");
@@ -391,6 +516,8 @@ mod tests {
         BufReader::new(child.stdout.take().unwrap())
             .read_line(&mut address)
             .unwrap();
+        // The bus has read its configuration once it has an address.
+        let _ = std::fs::remove_file(&config);
         (Bus(child), address.trim().to_string())
     }
 

@@ -12,6 +12,7 @@ use std::{
 use swayipc;
 
 mod battery;
+mod devices;
 mod end_session;
 mod logind;
 mod monitor_labels;
@@ -1213,6 +1214,8 @@ fn main() {
     // Low-battery notifications, which gnome-settings-daemon's power
     // plugin gives the X11 session.
     glib::spawn_future_local(battery::run_warnings());
+    // And those for the batteries of wireless devices.
+    glib::spawn_future_local(devices::run_warnings());
 
     app.run();
 
