@@ -5,7 +5,8 @@
 //! Like the plugin, this follows the `WarningLevel` that UPower computes for
 //! its composite display device from the thresholds in UPower.conf: entering
 //! the low, critical or action level shows one notification, which is closed
-//! when the level drops back to none (on AC power or charged).
+//! when the level drops back to none (on AC power or charged). A UPS also
+//! warns when it starts discharging, that is when mains power fails.
 //!
 //! The batteries of wireless devices are followed in [`crate::devices`].
 
@@ -54,6 +55,8 @@ trait Device {
     fn percentage(&self) -> zbus::Result<f64>;
     #[dbus_proxy(property, name = "Type")]
     fn kind(&self) -> zbus::Result<u32>;
+    #[dbus_proxy(property)]
+    fn time_to_empty(&self) -> zbus::Result<i64>;
 }
 
 #[dbus_proxy(
@@ -126,22 +129,35 @@ pub(crate) async fn service_events(
 }
 
 /// UPower's `WarningLevel`, reduced to the levels that warn on battery.
-/// ("discharging" only applies to UPSes and does not warn here.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     None,
+    /// A UPS running on its battery; see [`Level::of_display`].
+    Discharging,
     Low,
     Critical,
     Action,
 }
 
 impl Level {
+    /// The level of a battery. "discharging" only warns for a UPS, see
+    /// [`Level::of_display`].
     pub fn from_upower(warning_level: u32) -> Level {
         match warning_level {
             3 => Level::Low,
             4 => Level::Critical,
             5 => Level::Action,
             _ => Level::None,
+        }
+    }
+
+    /// The level of the display device of type `kind`: like
+    /// [`Level::from_upower`], except that a UPS that is discharging warns,
+    /// as in gnome-settings-daemon.
+    pub fn of_display(warning_level: u32, kind: u32) -> Level {
+        match warning_level {
+            2 if kind == KIND_UPS => Level::Discharging,
+            _ => Level::from_upower(warning_level),
         }
     }
 }
@@ -194,13 +210,57 @@ impl Warning {
     }
 }
 
+/// How long a battery lasts, as gnome-settings-daemon's
+/// `gpm_get_timestring` puts it: whole minutes, rounded to the nearest.
+pub fn time_text(seconds: i64) -> String {
+    let minutes = (seconds as f64 / 60.0 + 0.5).floor() as i64;
+    let plural = |n: i64, one: &str, many: &str| {
+        if n == 1 {
+            format!("{n} {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    if minutes <= 0 {
+        return "Unknown time".to_string();
+    }
+    if minutes < 60 {
+        return plural(minutes, "minute", "minutes");
+    }
+    let (hours, minutes) = (minutes / 60, minutes % 60);
+    let hours = plural(hours, "hour", "hours");
+    if minutes == 0 {
+        hours
+    } else {
+        format!("{hours} {}", plural(minutes, "minute", "minutes"))
+    }
+}
+
 /// The notification for a level, with the texts gnome-settings-daemon uses,
-/// so both sessions warn alike. `critical_action` is what UPower does at the
-/// action level (`GetCriticalAction`).
-pub fn warning(level: Level, kind: u32, percentage: f64, critical_action: &str) -> Option<Warning> {
+/// so both sessions warn alike. `time_to_empty` (seconds, 0 for unknown) is
+/// reported while a UPS discharges; `critical_action` is what UPower does at
+/// the action level (`GetCriticalAction`).
+pub fn warning(
+    level: Level,
+    kind: u32,
+    percentage: f64,
+    time_to_empty: i64,
+    critical_action: &str,
+) -> Option<Warning> {
     let ups = kind == KIND_UPS;
     let (summary, body, icon, urgency, timeout_ms) = match level {
         Level::None => return None,
+        Level::Discharging => {
+            let remaining = if time_to_empty == 0 {
+                "Unknown amount".to_string()
+            } else {
+                time_text(time_to_empty)
+            };
+            return Some(Warning::low(
+                "UPS Discharging".to_string(),
+                format!("{remaining} of UPS backup power remaining ({percentage:.0}%)"),
+            ));
+        }
         Level::Low if ups => (
             "UPS Low",
             format!("{percentage:.0}% UPS power remaining"),
@@ -259,7 +319,11 @@ pub fn warning(level: Level, kind: u32, percentage: f64, critical_action: &str) 
 /// Which level is on screen, so each level is announced once.
 struct Tracker {
     level: Level,
+    /// The notification for `level`, while the current notification service
+    /// has it up.
     shown: Option<u32>,
+    /// The body of the discharging warning on screen, which follows the UPS.
+    body: String,
 }
 
 impl Tracker {
@@ -271,6 +335,9 @@ impl Tracker {
         notifications: &NotificationsProxy<'_>,
     ) {
         if level == self.level {
+            if let (Level::Discharging, Some(id)) = (level, self.shown) {
+                self.follow_discharge(id, device, notifications).await;
+            }
             return;
         }
         // Like gnome-settings-daemon: the previous warning goes away when
@@ -283,8 +350,9 @@ impl Tracker {
         self.level = Level::None;
         let kind = device.kind().await.unwrap_or_default();
         let percentage = device.percentage().await.unwrap_or_default();
+        let time_to_empty = device.time_to_empty().await.unwrap_or_default();
         let action = upower.get_critical_action().await.unwrap_or_default();
-        let Some(warning) = warning(level, kind, percentage, &action) else {
+        let Some(warning) = warning(level, kind, percentage, time_to_empty, &action) else {
             return;
         };
         match notifications
@@ -303,10 +371,71 @@ impl Tracker {
             Ok(id) => {
                 self.level = level;
                 self.shown = Some(id);
+                self.body = warning.body;
             }
             // Retried on the next battery update, e.g. when the
             // notification server was not up yet at login.
             Err(e) => g_log!(glib::LogLevel::Warning, "Cannot show battery warning: {e}"),
+        }
+    }
+
+    /// While a UPS discharges, its warning counts the remaining time down in
+    /// place: a new text replaces the notification on screen.
+    async fn follow_discharge(
+        &mut self,
+        id: u32,
+        device: &DeviceProxy<'_>,
+        notifications: &NotificationsProxy<'_>,
+    ) {
+        let kind = device.kind().await.unwrap_or_default();
+        let percentage = device.percentage().await.unwrap_or_default();
+        let time_to_empty = device.time_to_empty().await.unwrap_or_default();
+        let Some(warning) = warning(Level::Discharging, kind, percentage, time_to_empty, "") else {
+            return;
+        };
+        if warning.body == self.body {
+            return;
+        }
+        match notifications
+            .notify(
+                APP_NAME,
+                id,
+                warning.icon,
+                &warning.summary,
+                &warning.body,
+                &[],
+                warning.hints(),
+                warning.timeout_ms,
+            )
+            .await
+        {
+            Ok(id) => {
+                self.shown = Some(id);
+                self.body = warning.body;
+            }
+            // Retried on the next update.
+            Err(e) => g_log!(
+                glib::LogLevel::Warning,
+                "Cannot update battery warning: {e}"
+            ),
+        }
+    }
+
+    /// The notification service went away or was replaced: the old
+    /// instance's id means nothing to the next one. A discharging warning
+    /// that was up is shown again once a service is there; the other levels
+    /// stay as they were.
+    fn service_changed(&mut self) {
+        if self.shown.take().is_some() && self.level == Level::Discharging {
+            self.level = Level::None;
+        }
+    }
+
+    /// The server closed a notification by itself (it expired, or the user
+    /// dismissed it): never close or replace that id.
+    fn closed(&mut self, id: u32) {
+        if self.shown == Some(id) {
+            self.shown = None;
         }
     }
 }
@@ -319,20 +448,47 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
     let mut tracker = Tracker {
         level: Level::None,
         shown: None,
+        body: String::new(),
     };
 
     // Re-read the level on every battery update: a warning that could not
     // be shown is retried, and an unchanged level is a no-op.
-    let levels = device.receive_warning_level_changed().await.map(|_| ());
-    let percentages = device.receive_percentage_changed().await.map(|_| ());
-    let mut updates = stream::select(levels, percentages);
+    let levels = device.receive_warning_level_changed().await.map(|_| None);
+    let percentages = device.receive_percentage_changed().await.map(|_| None);
+    let times = device.receive_time_to_empty_changed().await.map(|_| None);
+    let (mut owner, service) = service_events(session).await?;
+    let service = service.map(Some);
+    let mut updates = stream::select(
+        stream::select(levels, percentages),
+        stream::select(times, service),
+    );
     loop {
-        let level = Level::from_upower(device.warning_level().await?);
+        let kind = device.kind().await.unwrap_or_default();
+        let level = Level::of_display(device.warning_level().await?, kind);
         tracker
             .update(level, &device, &upower, &notifications)
             .await;
-        if updates.next().await.is_none() {
-            return Ok(());
+        loop {
+            match updates.next().await {
+                None => return Ok(()),
+                Some(None) => break,
+                Some(Some(ServiceEvent::Closed(id))) => tracker.closed(id),
+                Some(Some(ServiceEvent::Owner(new))) => {
+                    if new == owner {
+                        continue;
+                    }
+                    if owner.is_some() {
+                        tracker.service_changed();
+                    }
+                    owner = new;
+                    // A discharging warning that could not be shown, or was
+                    // lost with the old service, goes out now; the other
+                    // levels wait for the next battery update, as before.
+                    if owner.is_some() && level == Level::Discharging {
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -379,31 +535,93 @@ pub(crate) mod tests {
 
     #[test]
     fn warning_texts_follow_gnome() {
-        let low = warning(Level::Low, 2, 9.6, "HybridSleep").unwrap();
+        let low = warning(Level::Low, 2, 9.6, 0, "HybridSleep").unwrap();
         assert_eq!(
             (low.summary.as_str(), low.body.as_str(), low.urgency),
             ("Low Battery", "10% battery remaining", 1)
         );
         assert_eq!(low.timeout_ms, 30_000);
-        let critical = warning(Level::Critical, 2, 4.0, "HybridSleep").unwrap();
+        let critical = warning(Level::Critical, 2, 4.0, 0, "HybridSleep").unwrap();
         assert_eq!(
             (critical.summary.as_str(), critical.body.as_str()),
             ("Battery Almost Empty", "Connect power now")
         );
         assert_eq!((critical.urgency, critical.timeout_ms), (2, 0));
-        let action = warning(Level::Action, 2, 1.0, "PowerOff").unwrap();
+        let action = warning(Level::Action, 2, 1.0, 0, "PowerOff").unwrap();
         assert_eq!(action.body, "This device is about to shutdown");
         assert_eq!(
-            warning(Level::Low, KIND_UPS, 20.0, "").unwrap().summary,
+            warning(Level::Low, KIND_UPS, 20.0, 0, "").unwrap().summary,
             "UPS Low"
         );
-        assert_eq!(warning(Level::None, 2, 50.0, ""), None);
+        assert_eq!(warning(Level::None, 2, 50.0, 0, ""), None);
+    }
+
+    #[test]
+    fn only_a_ups_warns_when_discharging() {
+        assert_eq!(Level::of_display(2, KIND_UPS), Level::Discharging);
+        assert_eq!(Level::of_display(2, 2), Level::None);
+        assert_eq!(Level::of_display(3, KIND_UPS), Level::Low);
+        assert_eq!(Level::of_display(1, KIND_UPS), Level::None);
+        let discharging = warning(Level::Discharging, KIND_UPS, 54.6, 1500, "").unwrap();
+        assert_eq!(
+            (discharging.summary.as_str(), discharging.body.as_str()),
+            (
+                "UPS Discharging",
+                "25 minutes of UPS backup power remaining (55%)"
+            )
+        );
+        assert_eq!(
+            (
+                discharging.urgency,
+                discharging.transient,
+                discharging.timeout_ms
+            ),
+            (1, true, 30_000)
+        );
+        assert_eq!(
+            warning(Level::Discharging, KIND_UPS, 20.0, 0, "")
+                .unwrap()
+                .body,
+            "Unknown amount of UPS backup power remaining (20%)"
+        );
+    }
+
+    #[test]
+    fn time_texts_follow_gnome() {
+        for (seconds, text) in [
+            (0, "Unknown time"),
+            (29, "Unknown time"),
+            (30, "1 minute"),
+            (90, "2 minutes"),
+            (1500, "25 minutes"),
+            (3569, "59 minutes"),
+            (3570, "1 hour"),
+            (3630, "1 hour 1 minute"),
+            (7200, "2 hours"),
+            (7530, "2 hours 6 minutes"),
+        ] {
+            assert_eq!(time_text(seconds), text, "{seconds} s");
+        }
     }
 
     /// The display device of a fake UPower.
     struct FakeDevice {
+        kind: u32,
         warning_level: u32,
         percentage: f64,
+        time_to_empty: i64,
+    }
+
+    impl FakeDevice {
+        /// A laptop battery.
+        fn battery(warning_level: u32, percentage: f64) -> FakeDevice {
+            FakeDevice {
+                kind: 2,
+                warning_level,
+                percentage,
+                time_to_empty: 0,
+            }
+        }
     }
 
     #[dbus_interface(name = "org.freedesktop.UPower.Device")]
@@ -418,7 +636,11 @@ pub(crate) mod tests {
         }
         #[dbus_interface(property, name = "Type")]
         fn kind(&self) -> u32 {
-            2
+            self.kind
+        }
+        #[dbus_interface(property)]
+        fn time_to_empty(&self) -> i64 {
+            self.time_to_empty
         }
     }
 
@@ -443,7 +665,7 @@ pub(crate) mod tests {
         fn notify(
             &mut self,
             _app_name: &str,
-            _replaces_id: u32,
+            replaces_id: u32,
             _app_icon: &str,
             summary: &str,
             body: &str,
@@ -451,16 +673,25 @@ pub(crate) mod tests {
             hints: HashMap<&str, Value<'_>>,
             _expire_timeout: i32,
         ) -> u32 {
-            self.next_id += 1;
             let urgency = match hints.get("urgency") {
                 Some(Value::U8(u)) => *u,
                 _ => 255,
             };
-            self.log.lock().unwrap().push(format!(
-                "notify {} {summary}: {body} (urgency {urgency})",
+            let id = if replaces_id == 0 {
+                self.next_id += 1;
                 self.next_id
+            } else {
+                replaces_id
+            };
+            let replaces = if replaces_id == 0 {
+                String::new()
+            } else {
+                format!(" (replaces {replaces_id})")
+            };
+            self.log.lock().unwrap().push(format!(
+                "notify {id}{replaces} {summary}: {body} (urgency {urgency})"
             ));
-            self.next_id
+            id
         }
         fn close_notification(&mut self, id: u32) {
             self.log.lock().unwrap().push(format!("close {id}"));
@@ -523,22 +754,52 @@ pub(crate) mod tests {
 
     const DISPLAY_DEVICE: &str = "/org/freedesktop/UPower/devices/DisplayDevice";
 
-    /// Set the battery level and announce what changed, as UPower does.
-    async fn set_battery(service: &Connection, warning_level: u32, percentage: f64) {
+    /// Change properties of the display device and announce them in one
+    /// `PropertiesChanged` signal, as UPower does.
+    async fn set_display(service: &Connection, changes: &[(&str, Value<'_>)]) {
         let iface = service
             .object_server()
             .interface::<_, FakeDevice>(DISPLAY_DEVICE)
             .await
             .unwrap();
         let mut device = iface.get_mut().await;
-        let level_changed = device.warning_level != warning_level;
-        device.percentage = percentage;
-        device.warning_level = warning_level;
-        let ctxt: &SignalContext = iface.signal_context();
-        device.percentage_changed(ctxt).await.unwrap();
-        if level_changed {
-            device.warning_level_changed(ctxt).await.unwrap();
+        let mut changed = HashMap::new();
+        for (name, value) in changes {
+            match (*name, value) {
+                ("WarningLevel", Value::U32(level)) => device.warning_level = *level,
+                ("Percentage", Value::F64(percentage)) => device.percentage = *percentage,
+                ("TimeToEmpty", Value::I64(seconds)) => device.time_to_empty = *seconds,
+                _ => panic!("cannot set {name} to {value:?}"),
+            }
+            changed.insert(*name, value);
         }
+        let ctxt: &SignalContext = iface.signal_context();
+        zbus::fdo::Properties::properties_changed(
+            ctxt,
+            "org.freedesktop.UPower.Device".try_into().unwrap(),
+            &changed,
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Set the battery level and announce what changed.
+    async fn set_battery(service: &Connection, warning_level: u32, percentage: f64) {
+        let level_changed = service
+            .object_server()
+            .interface::<_, FakeDevice>(DISPLAY_DEVICE)
+            .await
+            .unwrap()
+            .get()
+            .await
+            .warning_level
+            != warning_level;
+        let mut changes = vec![("Percentage", Value::F64(percentage))];
+        if level_changed {
+            changes.push(("WarningLevel", Value::U32(warning_level)));
+        }
+        set_display(service, &changes).await;
     }
 
     fn wait_for(log: &Arc<Mutex<Vec<String>>>, len: usize) -> Vec<String> {
@@ -561,13 +822,7 @@ pub(crate) mod tests {
                 .name("org.freedesktop.UPower")?
                 .name("org.freedesktop.Notifications")?
                 .serve_at("/org/freedesktop/UPower", FakeUPower)?
-                .serve_at(
-                    DISPLAY_DEVICE,
-                    FakeDevice {
-                        warning_level: 1,
-                        percentage: 50.0,
-                    },
-                )?
+                .serve_at(DISPLAY_DEVICE, FakeDevice::battery(1, 50.0))?
                 .serve_at(
                     "/org/freedesktop/Notifications",
                     FakeNotifications {
@@ -644,13 +899,7 @@ pub(crate) mod tests {
                 .name("org.freedesktop.UPower")?
                 .name("org.freedesktop.Notifications")?
                 .serve_at("/org/freedesktop/UPower", FakeUPower)?
-                .serve_at(
-                    DISPLAY_DEVICE,
-                    FakeDevice {
-                        warning_level: 4,
-                        percentage: 4.0,
-                    },
-                )?
+                .serve_at(DISPLAY_DEVICE, FakeDevice::battery(4, 4.0))?
                 .serve_at(
                     "/org/freedesktop/Notifications",
                     FakeNotifications {
@@ -687,13 +936,7 @@ pub(crate) mod tests {
             ConnectionBuilder::address(address.as_str())?
                 .name("org.freedesktop.UPower")?
                 .serve_at("/org/freedesktop/UPower", FakeUPower)?
-                .serve_at(
-                    DISPLAY_DEVICE,
-                    FakeDevice {
-                        warning_level: 3,
-                        percentage: 10.0,
-                    },
-                )?
+                .serve_at(DISPLAY_DEVICE, FakeDevice::battery(3, 10.0))?
                 .build()
                 .await
         })
@@ -728,5 +971,85 @@ pub(crate) mod tests {
             wait_for(&log, 1),
             ["notify 1 Low Battery: 9% battery remaining (urgency 1)"]
         );
+    }
+
+    /// While a UPS runs on its battery the warning counts the remaining time
+    /// down in place, and it gives way to the next level.
+    #[test]
+    fn ups_discharging_counts_down_in_place() {
+        let (_bus, address) = private_bus();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let service = zbus::block_on(async {
+            ConnectionBuilder::address(address.as_str())?
+                .name("org.freedesktop.UPower")?
+                .name("org.freedesktop.Notifications")?
+                .serve_at("/org/freedesktop/UPower", FakeUPower)?
+                .serve_at(
+                    DISPLAY_DEVICE,
+                    FakeDevice {
+                        kind: KIND_UPS,
+                        warning_level: 1,
+                        percentage: 100.0,
+                        time_to_empty: 0,
+                    },
+                )?
+                .serve_at(
+                    "/org/freedesktop/Notifications",
+                    FakeNotifications {
+                        log: log.clone(),
+                        next_id: 0,
+                    },
+                )?
+                .build()
+                .await
+        })
+        .unwrap();
+        let watcher_address = address.clone();
+        std::thread::spawn(move || {
+            zbus::block_on(async {
+                let conn = ConnectionBuilder::address(watcher_address.as_str())?
+                    .build()
+                    .await?;
+                watch(&conn, &conn).await
+            })
+        });
+        std::thread::sleep(Duration::from_millis(500));
+
+        // The properties that change, and the calls that follow.
+        type Step<'a> = (&'a [(&'a str, Value<'a>)], &'a [&'a str]);
+        let steps: &[Step] = &[
+            // Mains power fails.
+            (
+                &[
+                    ("WarningLevel", Value::U32(2)),
+                    ("Percentage", Value::F64(95.0)),
+                    ("TimeToEmpty", Value::I64(1500)),
+                ],
+                &["notify 1 UPS Discharging: 25 minutes of UPS backup power remaining (95%) (urgency 1)"],
+            ),
+            // The same text: nothing to update.
+            (&[("TimeToEmpty", Value::I64(1490))], &[]),
+            (
+                &[
+                    ("Percentage", Value::F64(90.2)),
+                    ("TimeToEmpty", Value::I64(1200)),
+                ],
+                &["notify 1 (replaces 1) UPS Discharging: 20 minutes of UPS backup power remaining (90%) (urgency 1)"],
+            ),
+            (
+                &[
+                    ("WarningLevel", Value::U32(3)),
+                    ("Percentage", Value::F64(20.0)),
+                ],
+                &["close 1", "notify 2 UPS Low: 20% UPS power remaining (urgency 1)"],
+            ),
+            (&[("WarningLevel", Value::U32(1))], &["close 2"]),
+        ];
+        let mut expected: Vec<String> = Vec::new();
+        for (index, (changes, calls)) in steps.iter().enumerate() {
+            zbus::block_on(set_display(&service, changes));
+            expected.extend(calls.iter().map(|c| c.to_string()));
+            assert_eq!(wait_for(&log, expected.len()), expected, "step {index}");
+        }
     }
 }
