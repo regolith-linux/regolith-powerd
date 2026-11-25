@@ -494,13 +494,16 @@ impl Tracker {
     }
 
     /// The notification service went away or was replaced: the old
-    /// instance's id means nothing to the next one. A discharging warning
-    /// that was up is shown again once a service is there; the other levels
-    /// stay as they were.
-    fn service_changed(&mut self) {
-        if self.shown.take().is_some() && self.level == Level::Discharging {
+    /// instance's id means nothing to the next one. A warning that was up
+    /// is to be shown again once a service is there; returns whether there
+    /// was one. (A critical warning never expires, so the user would
+    /// otherwise lose it.)
+    fn service_changed(&mut self) -> bool {
+        let lost = self.shown.take().is_some();
+        if lost {
             self.level = Level::None;
         }
+        lost
     }
 
     /// The server closed a notification by itself (it expired, or the user
@@ -566,6 +569,8 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
         service.map(Update::Service),
     );
     let mut display = Display::read(&device).await?;
+    // A warning was lost with a notification service that went away.
+    let mut lost = false;
     loop {
         tracker.update(&display, &upower, &notifications).await;
         loop {
@@ -589,13 +594,15 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
                         continue;
                     }
                     if owner.is_some() {
-                        tracker.service_changed();
+                        lost |= tracker.service_changed();
                     }
                     owner = new;
-                    // A discharging warning that could not be shown, or was
-                    // lost with the old service, goes out now; the other
-                    // levels wait for the next battery update, as before.
-                    if owner.is_some() && display.level() == Level::Discharging {
+                    // A warning lost with the old service, or a discharging
+                    // warning that could not be shown, goes out now; other
+                    // warnings that could not be shown wait for the next
+                    // battery update, as before.
+                    if owner.is_some() && (lost || display.level() == Level::Discharging) {
+                        lost = false;
                         break;
                     }
                 }
@@ -807,6 +814,12 @@ pub(crate) mod tests {
         fn close_notification(&mut self, id: u32) {
             self.log.lock().unwrap().push(format!("close {id}"));
         }
+        #[dbus_interface(signal)]
+        async fn notification_closed(
+            ctxt: &SignalContext<'_>,
+            id: u32,
+            reason: u32,
+        ) -> zbus::Result<()>;
     }
 
     pub(crate) struct Bus(Child);
@@ -1238,6 +1251,17 @@ pub(crate) mod tests {
             );
         }
 
+        /// The notification service closes a notification by itself.
+        fn expire(&self, id: u32) {
+            let conn = self.notifications.as_ref().unwrap();
+            zbus::block_on(async {
+                let ctxt = SignalContext::new(conn, "/org/freedesktop/Notifications").unwrap();
+                FakeNotifications::notification_closed(&ctxt, id, 1)
+                    .await
+                    .unwrap();
+            });
+        }
+
         /// Announce each of `signals` as soon as the one before, without
         /// waiting for the daemon in between.
         fn burst(&self, signals: &[&[(&str, Value<'_>)]]) {
@@ -1323,5 +1347,23 @@ pub(crate) mod tests {
                 "notify 2 Battery Almost Empty: Connect power now (urgency 2)",
             ],
         );
+    }
+
+    /// A warning that is up when the notification service restarts is
+    /// shown again on the new one; one the server closed is not.
+    #[test]
+    fn shows_the_warning_again_on_a_restarted_notification_service() {
+        let mut world = World::new(FakeDevice::battery(4, 4.0));
+        let critical = "Battery Almost Empty: Connect power now (urgency 2)";
+        let log = &mut Vec::new();
+        world.expect(log, &[&format!("notify 1 {critical}")]);
+        world.start_notifications();
+        world.expect(log, &[&format!("notify 1 {critical}")]);
+        // Dismissed by the user: it stays down.
+        world.expire(1);
+        world.start_notifications();
+        world.expect(log, &[]);
+        world.burst(&[&[("WarningLevel", Value::U32(1))]]);
+        world.expect(log, &[]);
     }
 }
