@@ -6,7 +6,9 @@
 //! its composite display device from the thresholds in UPower.conf: entering
 //! the low, critical or action level shows one notification, which is closed
 //! when the level drops back to none (on AC power or charged). A UPS also
-//! warns when it starts discharging, that is when mains power fails.
+//! warns when it starts discharging, that is when mains power fails. Every
+//! change UPower signals is acted on, in order, so a level that lasts only
+//! a moment still shows and withdraws its warning.
 //!
 //! The batteries of wireless devices are followed in [`crate::devices`].
 
@@ -16,15 +18,18 @@ use std::pin::Pin;
 use zbus::export::futures_util::stream::{self, Stream};
 use zbus::export::futures_util::StreamExt;
 use zbus::export::ordered_stream::{self, OrderedStreamExt};
-use zbus::fdo::DBusProxy;
-use zbus::names::WellKnownName;
-use zbus::zvariant::Value;
+use zbus::fdo::{DBusProxy, PropertiesProxy};
+use zbus::names::{InterfaceName, WellKnownName};
+use zbus::zvariant::{OwnedValue, Value};
 use zbus::{dbus_proxy, Connection};
 
 pub(crate) const APP_NAME: &str = "Power";
 const LOW_TIMEOUT_MS: i32 = 30_000;
 const RETRY_SECS: u32 = 60;
 const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
+const UPOWER: &str = "org.freedesktop.UPower";
+const DEVICE_INTERFACE: &str = "org.freedesktop.UPower.Device";
+const DISPLAY_DEVICE: &str = "/org/freedesktop/UPower/devices/DisplayDevice";
 
 // UPower's UpDeviceKind values for the display device.
 const KIND_UPS: u32 = 3;
@@ -41,22 +46,6 @@ pub(crate) trait UPower {
     fn device_added(&self, device: zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
     #[dbus_proxy(signal)]
     fn device_removed(&self, device: zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
-}
-
-#[dbus_proxy(
-    interface = "org.freedesktop.UPower.Device",
-    default_service = "org.freedesktop.UPower",
-    default_path = "/org/freedesktop/UPower/devices/DisplayDevice"
-)]
-trait Device {
-    #[dbus_proxy(property)]
-    fn warning_level(&self) -> zbus::Result<u32>;
-    #[dbus_proxy(property)]
-    fn percentage(&self) -> zbus::Result<f64>;
-    #[dbus_proxy(property, name = "Type")]
-    fn kind(&self) -> zbus::Result<u32>;
-    #[dbus_proxy(property)]
-    fn time_to_empty(&self) -> zbus::Result<i64>;
 }
 
 #[dbus_proxy(
@@ -316,6 +305,83 @@ pub fn warning(
     })
 }
 
+/// The display device's properties that decide its warning.
+#[derive(Debug, Default)]
+struct Display {
+    kind: u32,
+    warning_level: u32,
+    percentage: f64,
+    /// Seconds, 0 for unknown.
+    time_to_empty: i64,
+}
+
+impl Display {
+    /// Read all of the display device.
+    async fn read(proxy: &PropertiesProxy<'_>) -> zbus::Result<Display> {
+        let mut display = Display::default();
+        let interface = InterfaceName::from_static_str_unchecked(DEVICE_INTERFACE);
+        for (name, value) in proxy.get_all(interface).await? {
+            display.set(&name, &value);
+        }
+        Ok(display)
+    }
+
+    /// Take a property's value, if it is one that decides the warning and
+    /// of its type.
+    fn set(&mut self, name: &str, value: &Value<'_>) {
+        match name {
+            "Type" => self.kind = value.downcast_ref().copied().unwrap_or(self.kind),
+            "WarningLevel" => {
+                self.warning_level = value.downcast_ref().copied().unwrap_or(self.warning_level)
+            }
+            "Percentage" => {
+                self.percentage = value.downcast_ref().copied().unwrap_or(self.percentage)
+            }
+            "TimeToEmpty" => {
+                self.time_to_empty = value.downcast_ref().copied().unwrap_or(self.time_to_empty)
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply one `PropertiesChanged` signal: the values it carries as they
+    /// are, and the invalidated properties read back.
+    async fn apply(
+        &mut self,
+        changed: &HashMap<String, OwnedValue>,
+        invalidated: &[String],
+        proxy: &PropertiesProxy<'_>,
+    ) {
+        for (name, value) in changed {
+            self.set(name, value);
+        }
+        for name in invalidated {
+            let interface = InterfaceName::from_static_str_unchecked(DEVICE_INTERFACE);
+            match proxy.get(interface, name).await {
+                Ok(value) => self.set(name, &value),
+                Err(e) => g_log!(
+                    glib::LogLevel::Debug,
+                    "Cannot read {name} of the display device: {e}"
+                ),
+            }
+        }
+    }
+
+    fn level(&self) -> Level {
+        Level::of_display(self.warning_level, self.kind)
+    }
+}
+
+/// What the battery warnings follow.
+enum Update {
+    /// One `PropertiesChanged` signal of the display device: the values it
+    /// carries and the names of the properties it invalidates.
+    Changed(HashMap<String, OwnedValue>, Vec<String>),
+    /// UPower (re)started.
+    Started,
+    Service(ServiceEvent),
+}
+
 /// Which level is on screen, so each level is announced once.
 struct Tracker {
     level: Level,
@@ -329,14 +395,14 @@ struct Tracker {
 impl Tracker {
     async fn update(
         &mut self,
-        level: Level,
-        device: &DeviceProxy<'_>,
+        display: &Display,
         upower: &UPowerProxy<'_>,
         notifications: &NotificationsProxy<'_>,
     ) {
+        let level = display.level();
         if level == self.level {
             if let (Level::Discharging, Some(id)) = (level, self.shown) {
-                self.follow_discharge(id, device, notifications).await;
+                self.follow_discharge(id, display, notifications).await;
             }
             return;
         }
@@ -348,11 +414,14 @@ impl Tracker {
             }
         }
         self.level = Level::None;
-        let kind = device.kind().await.unwrap_or_default();
-        let percentage = device.percentage().await.unwrap_or_default();
-        let time_to_empty = device.time_to_empty().await.unwrap_or_default();
         let action = upower.get_critical_action().await.unwrap_or_default();
-        let Some(warning) = warning(level, kind, percentage, time_to_empty, &action) else {
+        let Some(warning) = warning(
+            level,
+            display.kind,
+            display.percentage,
+            display.time_to_empty,
+            &action,
+        ) else {
             return;
         };
         match notifications
@@ -384,13 +453,16 @@ impl Tracker {
     async fn follow_discharge(
         &mut self,
         id: u32,
-        device: &DeviceProxy<'_>,
+        display: &Display,
         notifications: &NotificationsProxy<'_>,
     ) {
-        let kind = device.kind().await.unwrap_or_default();
-        let percentage = device.percentage().await.unwrap_or_default();
-        let time_to_empty = device.time_to_empty().await.unwrap_or_default();
-        let Some(warning) = warning(Level::Discharging, kind, percentage, time_to_empty, "") else {
+        let Some(warning) = warning(
+            Level::Discharging,
+            display.kind,
+            display.percentage,
+            display.time_to_empty,
+            "",
+        ) else {
             return;
         };
         if warning.body == self.body {
@@ -443,37 +515,76 @@ impl Tracker {
 /// Watch the battery and notify until a connection fails.
 pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()> {
     let upower = UPowerProxy::new(system).await?;
-    let device = DeviceProxy::new(system).await?;
     let notifications = NotificationsProxy::new(session).await?;
+    let device = PropertiesProxy::builder(system)
+        .destination(UPOWER)?
+        .path(DISPLAY_DEVICE)?
+        .cache_properties(zbus::CacheProperties::No)
+        .build()
+        .await?;
     let mut tracker = Tracker {
         level: Level::None,
         shown: None,
         body: String::new(),
     };
 
-    // Re-read the level on every battery update: a warning that could not
-    // be shown is retried, and an unchanged level is a no-op.
-    let levels = device.receive_warning_level_changed().await.map(|_| None);
-    let percentages = device.receive_percentage_changed().await.map(|_| None);
-    let times = device.receive_time_to_empty_changed().await.map(|_| None);
-    let (mut owner, service) = service_events(session).await?;
-    let service = service.map(Some);
-    let mut updates = stream::select(
-        stream::select(levels, percentages),
-        stream::select(times, service),
+    // Subscribe before reading, so that no change slips through. Each
+    // signal is applied as it comes, in order: a level reported for a
+    // moment counts too. Every battery update also retries a warning that
+    // could not be shown, and an unchanged level is a no-op.
+    let changes =
+        OrderedStreamExt::filter_map(device.receive_properties_changed().await?, |signal| {
+            let args = signal.args().ok()?;
+            if args.interface_name().as_str() != DEVICE_INTERFACE {
+                return None;
+            }
+            let changed = args
+                .changed_properties()
+                .iter()
+                .map(|(name, value)| (name.to_string(), OwnedValue::from(value)))
+                .collect();
+            let invalidated = args
+                .invalidated_properties()
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+            Some(Update::Changed(changed, invalidated))
+        });
+    let started = OrderedStreamExt::filter_map(
+        DBusProxy::new(system)
+            .await?
+            .receive_name_owner_changed_with_args(&[(0, UPOWER)])
+            .await?,
+        |signal| {
+            let started = signal.args().ok()?.new_owner().is_some();
+            started.then_some(Update::Started)
+        },
     );
+    let (mut owner, service) = service_events(session).await?;
+    let mut updates = stream::select(
+        ordered_stream::join(changes, started).into_stream(),
+        service.map(Update::Service),
+    );
+    let mut display = Display::read(&device).await?;
     loop {
-        let kind = device.kind().await.unwrap_or_default();
-        let level = Level::of_display(device.warning_level().await?, kind);
-        tracker
-            .update(level, &device, &upower, &notifications)
-            .await;
+        tracker.update(&display, &upower, &notifications).await;
         loop {
             match updates.next().await {
                 None => return Ok(()),
-                Some(None) => break,
-                Some(Some(ServiceEvent::Closed(id))) => tracker.closed(id),
-                Some(Some(ServiceEvent::Owner(new))) => {
+                Some(Update::Changed(changed, invalidated)) => {
+                    display.apply(&changed, &invalidated, &device).await;
+                    break;
+                }
+                // A new UPower may report other values than its predecessor.
+                Some(Update::Started) => match Display::read(&device).await {
+                    Ok(read) => {
+                        display = read;
+                        break;
+                    }
+                    Err(e) => g_log!(glib::LogLevel::Debug, "Cannot read the display device: {e}"),
+                },
+                Some(Update::Service(ServiceEvent::Closed(id))) => tracker.closed(id),
+                Some(Update::Service(ServiceEvent::Owner(new))) => {
                     if new == owner {
                         continue;
                     }
@@ -484,7 +595,7 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
                     // A discharging warning that could not be shown, or was
                     // lost with the old service, goes out now; the other
                     // levels wait for the next battery update, as before.
-                    if owner.is_some() && level == Level::Discharging {
+                    if owner.is_some() && display.level() == Level::Discharging {
                         break;
                     }
                 }
@@ -752,8 +863,6 @@ pub(crate) mod tests {
         (Bus(child), address.trim().to_string())
     }
 
-    const DISPLAY_DEVICE: &str = "/org/freedesktop/UPower/devices/DisplayDevice";
-
     /// Change properties of the display device and announce them in one
     /// `PropertiesChanged` signal, as UPower does.
     async fn set_display(service: &Connection, changes: &[(&str, Value<'_>)]) {
@@ -776,7 +885,7 @@ pub(crate) mod tests {
         let ctxt: &SignalContext = iface.signal_context();
         zbus::fdo::Properties::properties_changed(
             ctxt,
-            "org.freedesktop.UPower.Device".try_into().unwrap(),
+            InterfaceName::from_static_str_unchecked(DEVICE_INTERFACE),
             &changed,
             &[],
         )
@@ -1051,5 +1160,168 @@ pub(crate) mod tests {
             expected.extend(calls.iter().map(|c| c.to_string()));
             assert_eq!(wait_for(&log, expected.len()), expected, "step {index}");
         }
+    }
+
+    /// A private bus with a fake UPower, a notification server and the
+    /// battery warnings following them.
+    struct World {
+        _bus: Bus,
+        address: String,
+        upower: Option<Connection>,
+        notifications: Option<Connection>,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl World {
+        fn new(display: FakeDevice) -> World {
+            let (bus, address) = private_bus();
+            let mut world = World {
+                _bus: bus,
+                address: address.clone(),
+                upower: None,
+                notifications: None,
+                log: Arc::default(),
+            };
+            world.start_upower(display);
+            world.start_notifications();
+            std::thread::spawn(move || {
+                zbus::block_on(async {
+                    let conn = ConnectionBuilder::address(address.as_str())?
+                        .build()
+                        .await?;
+                    watch(&conn, &conn).await
+                })
+            });
+            std::thread::sleep(Duration::from_millis(500));
+            world
+        }
+
+        /// Start a new instance of UPower, in place of the one there may be.
+        fn start_upower(&mut self, display: FakeDevice) {
+            if let Some(old) = self.upower.take() {
+                zbus::block_on(old.release_name("org.freedesktop.UPower")).unwrap();
+            }
+            let address = self.address.clone();
+            self.upower = Some(
+                zbus::block_on(async {
+                    ConnectionBuilder::address(address.as_str())?
+                        .name("org.freedesktop.UPower")?
+                        .serve_at("/org/freedesktop/UPower", FakeUPower)?
+                        .serve_at(DISPLAY_DEVICE, display)?
+                        .build()
+                        .await
+                })
+                .unwrap(),
+            );
+        }
+
+        /// Start a new instance of the notification service, in place of
+        /// the one there may be.
+        fn start_notifications(&mut self) {
+            if let Some(old) = self.notifications.take() {
+                zbus::block_on(old.release_name("org.freedesktop.Notifications")).unwrap();
+            }
+            let address = self.address.clone();
+            let server = FakeNotifications {
+                log: self.log.clone(),
+                next_id: 0,
+            };
+            self.notifications = Some(
+                zbus::block_on(async {
+                    ConnectionBuilder::address(address.as_str())?
+                        .name("org.freedesktop.Notifications")?
+                        .serve_at("/org/freedesktop/Notifications", server)?
+                        .build()
+                        .await
+                })
+                .unwrap(),
+            );
+        }
+
+        /// Announce each of `signals` as soon as the one before, without
+        /// waiting for the daemon in between.
+        fn burst(&self, signals: &[&[(&str, Value<'_>)]]) {
+            let upower = self.upower.as_ref().unwrap();
+            zbus::block_on(async {
+                for changes in signals {
+                    set_display(upower, changes).await;
+                }
+            });
+        }
+
+        /// Check that the log grew by exactly `calls`.
+        #[track_caller]
+        fn expect(&self, expected: &mut Vec<String>, calls: &[&str]) {
+            expected.extend(calls.iter().map(|call| call.to_string()));
+            assert_eq!(&wait_for(&self.log, expected.len()), expected);
+        }
+    }
+
+    /// Every level UPower reports is acted on, however briefly it lasts.
+    #[test]
+    fn acts_on_every_level_in_order() {
+        let ups = World::new(FakeDevice {
+            kind: KIND_UPS,
+            warning_level: 1,
+            percentage: 80.0,
+            time_to_empty: 0,
+        });
+        ups.burst(&[
+            &[
+                ("WarningLevel", Value::U32(2)),
+                ("TimeToEmpty", Value::I64(600)),
+            ],
+            &[("WarningLevel", Value::U32(1))],
+            &[("WarningLevel", Value::U32(2))],
+        ]);
+        let discharging =
+            "UPS Discharging: 10 minutes of UPS backup power remaining (80%) (urgency 1)";
+        ups.expect(
+            &mut Vec::new(),
+            &[
+                &format!("notify 1 {discharging}"),
+                "close 1",
+                &format!("notify 2 {discharging}"),
+            ],
+        );
+
+        let laptop = World::new(FakeDevice::battery(3, 10.0));
+        let log = &mut Vec::new();
+        laptop.expect(
+            log,
+            &["notify 1 Low Battery: 10% battery remaining (urgency 1)"],
+        );
+        laptop.burst(&[
+            &[("WarningLevel", Value::U32(1))],
+            &[("WarningLevel", Value::U32(3))],
+        ]);
+        laptop.expect(
+            log,
+            &[
+                "close 1",
+                "notify 2 Low Battery: 10% battery remaining (urgency 1)",
+            ],
+        );
+    }
+
+    /// A UPower that restarts may report another level than before.
+    #[test]
+    fn reads_the_display_device_again_when_upower_restarts() {
+        let mut world = World::new(FakeDevice::battery(1, 50.0));
+        world.start_upower(FakeDevice::battery(3, 10.0));
+        let log = &mut Vec::new();
+        world.expect(
+            log,
+            &["notify 1 Low Battery: 10% battery remaining (urgency 1)"],
+        );
+        // And its signals are followed.
+        world.burst(&[&[("WarningLevel", Value::U32(4))]]);
+        world.expect(
+            log,
+            &[
+                "close 1",
+                "notify 2 Battery Almost Empty: Connect power now (urgency 2)",
+            ],
+        );
     }
 }
