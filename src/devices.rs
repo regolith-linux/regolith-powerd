@@ -249,6 +249,7 @@ struct Warnings {
 /// What to do with a device's notification.
 #[derive(Debug, PartialEq)]
 enum Action {
+    /// Nothing to say, not even an escalation still pending.
     Nothing,
     Close,
     /// Show this severity, unless it is already pending.
@@ -455,7 +456,12 @@ impl Watcher<'_> {
             Action::Close
         };
         match action {
-            Action::Nothing => {}
+            Action::Nothing => {
+                // Unknown or discharging says nothing about the battery: an
+                // escalation that was refused waits for the next rise.
+                followed.shown.pending = None;
+                return;
+            }
             Action::Close => {
                 if state.is_peripheral() {
                     self.warnings.recovered(&identity);
@@ -1267,6 +1273,29 @@ mod tests {
         world.expect(
             log,
             &[&format!("notify 2 replaces 0 {}", mouse_critical(4))],
+        );
+    }
+
+    /// A critical warning the server refused is not sent later at a level
+    /// that never warns; the next rise above low tries again.
+    #[test]
+    fn a_refused_escalation_waits_for_the_next_rise() {
+        let world = World::new(&[(MOUSE, mouse(3, 9.0))], true);
+        let log = &mut Vec::new();
+        world.expect(log, &[&format!("notify 1 replaces 0 {MOUSE_LOW} (9%)")]);
+        world.refuse.store(true, Ordering::SeqCst);
+        world.set_level(MOUSE, 4, 4.0);
+        world.expect(log, &["refused Mouse battery low"]);
+        world.refuse.store(false, Ordering::SeqCst);
+        // Discharging and unknown say nothing about a device.
+        world.set_level(MOUSE, 2, 4.0);
+        world.set_level(MOUSE, 0, 4.0);
+        world.expect(log, &[]);
+        // Still on record as low, so this escalates.
+        world.set_level(MOUSE, 5, 3.0);
+        world.expect(
+            log,
+            &[&format!("notify 1 replaces 1 {}", mouse_critical(3))],
         );
     }
 }
