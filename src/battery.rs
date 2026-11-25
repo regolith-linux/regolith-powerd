@@ -442,8 +442,8 @@ impl Tracker {
                 self.shown = Some(id);
                 self.body = warning.body;
             }
-            // Retried on the next battery update, e.g. when the
-            // notification server was not up yet at login.
+            // Retried on the next battery update, and when a notification
+            // service appears: at login it may start after this daemon.
             Err(e) => g_log!(glib::LogLevel::Warning, "Cannot show battery warning: {e}"),
         }
     }
@@ -495,15 +495,12 @@ impl Tracker {
 
     /// The notification service went away or was replaced: the old
     /// instance's id means nothing to the next one. A warning that was up
-    /// is to be shown again once a service is there; returns whether there
-    /// was one. (A critical warning never expires, so the user would
-    /// otherwise lose it.)
-    fn service_changed(&mut self) -> bool {
-        let lost = self.shown.take().is_some();
-        if lost {
+    /// is shown again once a service is there. (A critical warning never
+    /// expires, so the user would otherwise lose it.)
+    fn service_changed(&mut self) {
+        if self.shown.take().is_some() {
             self.level = Level::None;
         }
-        lost
     }
 
     /// The server closed a notification by itself (it expired, or the user
@@ -569,8 +566,6 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
         service.map(Update::Service),
     );
     let mut display = Display::read(&device).await?;
-    // A warning was lost with a notification service that went away.
-    let mut lost = false;
     loop {
         tracker.update(&display, &upower, &notifications).await;
         loop {
@@ -594,15 +589,12 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
                         continue;
                     }
                     if owner.is_some() {
-                        lost |= tracker.service_changed();
+                        tracker.service_changed();
                     }
                     owner = new;
-                    // A warning lost with the old service, or a discharging
-                    // warning that could not be shown, goes out now; other
-                    // warnings that could not be shown wait for the next
-                    // battery update, as before.
-                    if owner.is_some() && (lost || display.level() == Level::Discharging) {
-                        lost = false;
+                    // A warning that could not be shown, or was lost with
+                    // the old service, goes out now.
+                    if owner.is_some() {
                         break;
                     }
                 }
@@ -1048,10 +1040,10 @@ pub(crate) mod tests {
     }
 
     /// At login the notification server may start after regolith-powerd.
-    /// A warning that could not be shown is retried on the next battery
-    /// update, even if the level has not changed.
+    /// A warning that could not be shown goes out as soon as the server is
+    /// there.
     #[test]
-    fn retries_when_the_notification_server_starts_late() {
+    fn warns_when_the_notification_server_starts_late() {
         let (_bus, address) = private_bus();
         let log = Arc::new(Mutex::new(Vec::new()));
         let upower = zbus::block_on(async {
@@ -1088,11 +1080,11 @@ pub(crate) mod tests {
                 .await
         })
         .unwrap();
+        let shown = ["notify 1 Low Battery: 10% battery remaining (urgency 1)"];
+        assert_eq!(wait_for(&log, 1), shown);
+        // Once.
         zbus::block_on(set_battery(&upower, 3, 9.0));
-        assert_eq!(
-            wait_for(&log, 1),
-            ["notify 1 Low Battery: 9% battery remaining (urgency 1)"]
-        );
+        assert_eq!(wait_for(&log, 1), shown);
     }
 
     /// While a UPS runs on its battery the warning counts the remaining time
