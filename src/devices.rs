@@ -17,10 +17,11 @@
 //! warnings up when it went away are shown again on its successor. An id is
 //! only ever replaced or closed through the instance that issued it, and
 //! never once it died: the service's news is taken in even while the daemon
-//! waits for an answer.
+//! waits for an answer. A slow answer holds up only the device it is about:
+//! that device's next steps wait for it, in order, the others go ahead.
 
 use glib::g_log;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;
 use std::pin::pin;
 use std::task::Poll;
@@ -32,7 +33,9 @@ use zbus::names::InterfaceName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream, MessageType};
 
-use crate::battery::{Issued, Notifier, Outcome, ServiceEvent, UPowerProxy, Warning};
+use crate::battery::{
+    Issued, Notice, Notifier, Outcome, ServiceEvent, Token, UPowerProxy, Warning,
+};
 
 const UPOWER: &str = "org.freedesktop.UPower";
 const DEVICE_INTERFACE: &str = "org.freedesktop.UPower.Device";
@@ -296,6 +299,41 @@ impl Warnings {
     }
 }
 
+/// What was read of a device: its properties, and the proxy to read them
+/// again.
+type Read = zbus::Result<(PropertiesProxy<'static>, State)>;
+
+/// One step for one device, in the order UPower reported it.
+enum Step {
+    /// Follow the device afresh with what was read of it: it was added, or
+    /// UPower (re)started.
+    Follow(OwnedObjectPath, Read),
+    Removed(OwnedObjectPath),
+    Changed(OwnedObjectPath, Changes),
+    /// Show what is to be shown again on a new notification service.
+    Show(OwnedObjectPath),
+}
+
+impl Step {
+    fn path(&self) -> &OwnedObjectPath {
+        match self {
+            Step::Follow(path, _)
+            | Step::Removed(path)
+            | Step::Changed(path, _)
+            | Step::Show(path) => path,
+        }
+    }
+}
+
+/// A device's warning that was sent and is not answered yet.
+struct Showing {
+    path: OwnedObjectPath,
+    identity: Identity,
+    severity: Severity,
+    /// Whether it announces a rise, rather than show again what was up.
+    rise: bool,
+}
+
 struct Watcher<'a> {
     system: &'a Connection,
     upower: UPowerProxy<'static>,
@@ -305,6 +343,13 @@ struct Watcher<'a> {
     /// Whether a notification service appeared, to show again there what
     /// was up on its predecessor, or could not be shown.
     reshow: bool,
+    /// The warnings that wait for their answer.
+    showing: HashMap<Token, Showing>,
+    /// The steps of devices whose warning waits for its answer, in order.
+    /// A device's next step may have to replace or close that warning, and
+    /// what was announced for it is only known once the answer is in; other
+    /// devices go ahead meanwhile.
+    waiting: VecDeque<Step>,
 }
 
 impl Watcher<'_> {
@@ -318,37 +363,101 @@ impl Watcher<'_> {
                 return;
             }
         };
-        let gone: Vec<_> = self
+        let mut gone: Vec<OwnedObjectPath> = Vec::new();
+        for path in self
             .followed
             .keys()
-            .filter(|path| !paths.contains(path))
-            .cloned()
-            .collect();
+            .chain(self.waiting.iter().map(Step::path))
+        {
+            if !paths.contains(path) && !gone.contains(path) {
+                gone.push(path.clone());
+            }
+        }
         for path in gone {
-            self.remove(&path).await;
+            self.step(Step::Removed(path)).await;
         }
         for path in paths {
-            self.follow(path).await;
+            let read = self.read(&path).await;
+            self.step(Step::Follow(path, read)).await;
         }
     }
 
-    /// Follow the device at `path`, or follow it afresh: read all of it. Its
-    /// changes come in through the subscription [`watch`] holds for every
-    /// device, so none is missed.
-    async fn follow(&mut self, path: OwnedObjectPath) {
-        let read = async {
-            let properties = PropertiesProxy::builder(self.system)
-                .destination(UPOWER)?
-                .path(path.clone())?
-                .cache_properties(zbus::CacheProperties::No)
-                .build()
-                .await?;
-            let all = properties
-                .get_all(InterfaceName::from_static_str_unchecked(DEVICE_INTERFACE))
-                .await?;
-            zbus::Result::Ok((properties, State::from_properties(&all)))
+    /// Read all of the device at `path`. Its changes come in through the
+    /// subscription [`watch`] holds for every device, so none is missed.
+    async fn read(&self, path: &OwnedObjectPath) -> Read {
+        let properties = PropertiesProxy::builder(self.system)
+            .destination(UPOWER)?
+            .path(path.clone())?
+            .cache_properties(zbus::CacheProperties::No)
+            .build()
+            .await?;
+        let all = properties
+            .get_all(InterfaceName::from_static_str_unchecked(DEVICE_INTERFACE))
+            .await?;
+        Ok((properties, State::from_properties(&all)))
+    }
+
+    /// Take a device's step now, or once the answers it waits for are in.
+    async fn step(&mut self, step: Step) {
+        if self
+            .waiting
+            .iter()
+            .any(|waiting| waiting.path() == step.path())
+            || self.waits(&step)
+        {
+            self.waiting.push_back(step);
+        } else {
+            self.take(step).await;
         }
-        .await;
+    }
+
+    /// Whether a step waits for the answer to a warning of its device: one
+    /// at the same path, or of the same identity.
+    fn waits(&self, step: &Step) -> bool {
+        let path = step.path();
+        let serial = match step {
+            Step::Follow(_, Ok((_, state))) => Some(state.serial.as_str()),
+            Step::Follow(_, Err(_)) => None,
+            Step::Changed(_, changes) => changes
+                .changed
+                .get("Serial")
+                .and_then(|serial| serial.downcast_ref::<str>())
+                .or_else(|| self.followed.get(path).map(|f| f.state.serial.as_str())),
+            Step::Removed(_) | Step::Show(_) => {
+                self.followed.get(path).map(|f| f.state.serial.as_str())
+            }
+        };
+        let identity = serial.map(|serial| Identity::of(serial, path));
+        self.showing
+            .values()
+            .any(|showing| &showing.path == path || identity.as_ref() == Some(&showing.identity))
+    }
+
+    /// Take the waiting steps whose answers are in, in order.
+    async fn take_waiting(&mut self) {
+        let mut still: VecDeque<Step> = VecDeque::new();
+        while let Some(step) = self.waiting.pop_front() {
+            if still.iter().any(|waiting| waiting.path() == step.path()) || self.waits(&step) {
+                still.push_back(step);
+            } else {
+                self.take(step).await;
+            }
+        }
+        self.waiting = still;
+    }
+
+    async fn take(&mut self, step: Step) {
+        match step {
+            Step::Follow(path, read) => self.follow(path, read).await,
+            Step::Removed(path) => self.remove(&path).await,
+            Step::Changed(path, changes) => self.changed(&path, changes).await,
+            Step::Show(path) => self.show(&path).await,
+        }
+    }
+
+    /// Follow the device at `path`, or follow it afresh, with what was read
+    /// of it.
+    async fn follow(&mut self, path: OwnedObjectPath, read: Read) {
         let (properties, state) = match read {
             Ok(read) => read,
             Err(e) => {
@@ -451,7 +560,7 @@ impl Watcher<'_> {
         let Some(followed) = self.followed.get(path) else {
             return;
         };
-        let shown = followed.shown.clone();
+        let shown = &followed.shown;
         let severity = match (shown.pending, shown.severity, &shown.id) {
             (Some(severity), _, _) => severity,
             (None, Some(severity), None) => severity,
@@ -460,15 +569,42 @@ impl Watcher<'_> {
         let state = &followed.state;
         let warning = warning(severity, state.kind, state.percentage, state.battery_level);
         let identity = Identity::of(&state.serial, path);
+        let rise = shown.pending.is_some();
         // A critical warning takes the place of the low one.
-        let outcome = self.notifier.notify(&warning, shown.id.as_ref()).await;
-        let Some(followed) = self.followed.get_mut(path) else {
+        let replaces = shown.id.clone();
+        match self.notifier.notify(&warning, replaces.as_ref()).await {
+            Ok(token) => {
+                self.showing.insert(
+                    token,
+                    Showing {
+                        path: path.clone(),
+                        identity,
+                        severity,
+                        rise,
+                    },
+                );
+            }
+            // Not announced: what was announced before still stands, and
+            // the next change, or a new notification service, tries again.
+            Err(e) => g_log!(
+                glib::LogLevel::Warning,
+                "Cannot show device battery warning: {e}"
+            ),
+        }
+    }
+
+    /// Apply the answer to a device's warning.
+    fn answered(&mut self, token: Token, answer: zbus::Result<Outcome>) {
+        let Some(showing) = self.showing.remove(&token) else {
             return;
         };
-        match outcome {
+        let Some(followed) = self.followed.get_mut(&showing.path) else {
+            return;
+        };
+        match answer {
             Ok(outcome) => {
                 followed.shown = Shown {
-                    severity: Some(severity),
+                    severity: Some(showing.severity),
                     id: None,
                     pending: None,
                 };
@@ -480,8 +616,8 @@ impl Watcher<'_> {
                     // Shown again on the next instance of the service.
                     Outcome::Lost => {}
                 }
-                if shown.pending.is_some() {
-                    self.warnings.accepted(identity, severity);
+                if showing.rise {
+                    self.warnings.accepted(showing.identity, showing.severity);
                 }
             }
             // Not announced: what was announced before still stands, and
@@ -504,12 +640,18 @@ impl Watcher<'_> {
         }
     }
 
-    /// Apply the notification service's news that has arrived. Done before
-    /// each step, so a step never acts on an id that died meanwhile, even
-    /// while the daemon waited for an answer.
+    /// Apply what the notification service told that has arrived. Done
+    /// before each step, so a step never acts on an id that died meanwhile.
     fn settle(&mut self) {
-        while let Some(event) = self.notifier.ready() {
-            self.service(event);
+        while let Some(notice) = self.notifier.ready() {
+            self.notice(notice);
+        }
+    }
+
+    fn notice(&mut self, notice: Notice) {
+        match notice {
+            Notice::Service(event) => self.service(event),
+            Notice::Answer(token, answer) => self.answered(token, answer),
         }
     }
 
@@ -546,16 +688,19 @@ impl Watcher<'_> {
     async fn handle(&mut self, event: Event) {
         match event {
             Event::Started => self.enumerate().await,
-            Event::Added(path) => self.follow(path).await,
-            Event::Removed(path) => self.remove(&path).await,
-            Event::Changed(path, changes) => self.changed(&path, changes).await,
+            Event::Added(path) => {
+                let read = self.read(&path).await;
+                self.step(Step::Follow(path, read)).await;
+            }
+            Event::Removed(path) => self.step(Step::Removed(path)).await,
+            Event::Changed(path, changes) => self.step(Step::Changed(path, changes)).await,
         }
     }
 }
 
 /// What the device warnings wait for.
 enum Next {
-    Service(ServiceEvent),
+    Notice(Notice),
     UPower(Event),
     /// Nothing from UPower is waiting: show again what is to be shown again.
     Reshow,
@@ -640,14 +785,18 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
         followed: HashMap::new(),
         warnings: Warnings::default(),
         reshow: false,
+        showing: HashMap::new(),
+        waiting: VecDeque::new(),
     };
     loop {
         watcher.settle();
+        watcher.take_waiting().await;
         let reshow = watcher.reshow;
         let next = poll_fn(|cx| {
-            // The notification service's news first: which ids died.
-            if let Poll::Ready(event) = watcher.notifier.poll_next(cx) {
-                return Poll::Ready(Some(Next::Service(event)));
+            // The notification service's news first: which ids died, and
+            // the answers that came in.
+            if let Poll::Ready(notice) = watcher.notifier.poll_next(cx) {
+                return Poll::Ready(Some(Next::Notice(notice)));
             }
             match events.as_mut().poll_next(cx) {
                 Poll::Ready(event) => Poll::Ready(event.map(Next::UPower)),
@@ -658,13 +807,13 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
         .await;
         match next {
             None => return Ok(()),
-            Some(Next::Service(event)) => watcher.service(event),
+            Some(Next::Notice(notice)) => watcher.notice(notice),
             Some(Next::UPower(event)) => watcher.handle(event).await,
             Some(Next::Reshow) => {
                 watcher.reshow = false;
                 let paths: Vec<_> = watcher.followed.keys().cloned().collect();
                 for path in paths {
-                    watcher.show(&path).await;
+                    watcher.step(Step::Show(path)).await;
                 }
             }
         }
@@ -885,7 +1034,7 @@ mod tests {
     }
 
     use crate::battery::tests::{assert_own_ids, private_bus, wait_up, Bus, Call, Calls};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use zbus::export::futures_util::lock::Mutex as Gate;
@@ -939,21 +1088,22 @@ mod tests {
 
     /// A notification server that records what it is asked to do, refuses
     /// to show anything while `refuse` is set, takes `delay_ms` to show a
-    /// notification and holds back its answer while `gate` is locked.
+    /// notification and holds back its answer while `gate` is locked. Its
+    /// other calls go on meanwhile.
     struct FakeNotifications {
         log: Arc<Mutex<Vec<String>>>,
         calls: Calls,
         refuse: Arc<AtomicBool>,
         delay_ms: Arc<AtomicU64>,
         gate: Arc<Gate<()>>,
-        next_id: u32,
+        next_id: AtomicU32,
     }
 
     #[dbus_interface(name = "org.freedesktop.Notifications")]
     impl FakeNotifications {
         #[allow(clippy::too_many_arguments)]
         async fn notify(
-            &mut self,
+            &self,
             _app_name: &str,
             replaces_id: u32,
             _app_icon: &str,
@@ -969,8 +1119,7 @@ mod tests {
                 return Err(zbus::fdo::Error::Failed("refused".into()));
             }
             let id = if replaces_id == 0 {
-                self.next_id += 1;
-                self.next_id
+                self.next_id.fetch_add(1, Ordering::SeqCst) + 1
             } else {
                 replaces_id
             };
@@ -987,7 +1136,7 @@ mod tests {
             let _open = self.gate.lock().await;
             Ok(id)
         }
-        fn close_notification(&mut self, id: u32) {
+        fn close_notification(&self, id: u32) {
             self.log.lock().unwrap().push(format!("close {id}"));
             self.calls.lock().unwrap().push(Call::Close(id));
         }
@@ -1098,7 +1247,7 @@ mod tests {
                 refuse: self.refuse.clone(),
                 delay_ms: self.delay_ms.clone(),
                 gate: self.gate.clone(),
-                next_id: 0,
+                next_id: AtomicU32::new(0),
             };
             let address = self.address.clone();
             self.notifications = Some(
@@ -1539,5 +1688,38 @@ mod tests {
         world.set_level(MOUSE, 1, 50.0);
         world.set_level(KEYBOARD, 1, 50.0);
         world.expect(log, &["close 3", "close 4"]);
+    }
+
+    /// While the server holds back its answer to the keyboard's warning, the
+    /// mouse recovers and runs low again: neither waits for that answer. The
+    /// keyboard's own recovery does, as it closes the warning the answer
+    /// names.
+    #[test]
+    fn a_slow_answer_holds_up_no_other_device() {
+        let keyboard = State {
+            kind: 6,
+            warning_level: 1,
+            percentage: 10.0,
+            battery_level: 1,
+            serial: "K1".into(),
+        };
+        let world = World::new(&[(MOUSE, mouse(3, 9.0)), (KEYBOARD, keyboard)], true);
+        let keyboard_low = "Keyboard battery low: Wireless keyboard is low on power (10%)";
+        let log = &mut Vec::new();
+        world.expect(log, &[&format!("notify 1 replaces 0 {MOUSE_LOW} (9%)")]);
+        let gate = world.gate.clone();
+        let held = zbus::block_on(gate.lock());
+        world.set_level(KEYBOARD, 3, 10.0);
+        world.expect(log, &[&format!("notify 2 replaces 0 {keyboard_low}")]);
+        world.set_level(MOUSE, 1, 50.0);
+        world.expect(log, &["close 1"]);
+        world.set_level(MOUSE, 3, 8.0);
+        world.expect(log, &[&format!("notify 3 replaces 0 {MOUSE_LOW} (8%)")]);
+        world.set_level(KEYBOARD, 1, 50.0);
+        world.expect(log, &[]);
+        drop(held);
+        world.expect(log, &["close 2"]);
+        world.set_level(MOUSE, 1, 50.0);
+        world.expect(log, &["close 3"]);
     }
 }

@@ -8,14 +8,18 @@
 //! when the level drops back to none (on AC power or charged). A UPS also
 //! warns when it starts discharging, that is when mains power fails. Every
 //! change UPower signals is acted on, in order, so a level that lasts only
-//! a moment still shows and withdraws its warning.
+//! a moment still shows and withdraws its warning. The notification server
+//! may be slow to answer: only a step that needs the id of a warning still
+//! to be answered waits for it. An update of the discharging warning holds
+//! up nothing, and a new level closes it right away.
 //!
 //! The batteries of wireless devices are followed in [`crate::devices`].
 
 use glib::g_log;
 use std::collections::{HashMap, VecDeque};
-use std::future::{poll_fn, Future};
-use std::pin::{pin, Pin};
+use std::future::poll_fn;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use zbus::export::futures_util::stream::{Fuse, Stream};
 use zbus::export::futures_util::{FutureExt, StreamExt};
@@ -23,11 +27,17 @@ use zbus::export::ordered_stream::{self, OrderedStreamExt};
 use zbus::fdo::{DBusProxy, PropertiesProxy};
 use zbus::names::{InterfaceName, OwnedUniqueName, WellKnownName};
 use zbus::zvariant::{OwnedValue, Value};
-use zbus::{dbus_proxy, Connection};
+use zbus::{
+    dbus_proxy, Connection, MatchRule, Message, MessageBuilder, MessageFlags, MessageStream,
+    MessageType,
+};
 
 const APP_NAME: &str = "Power";
 const LOW_TIMEOUT_MS: i32 = 30_000;
 const RETRY_SECS: u32 = 60;
+/// How many replies may wait until they are matched to their calls (zbus's
+/// default is 64). The connection stalls once they are queued up.
+const MAX_QUEUED_REPLIES: usize = 1024;
 const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 const UPOWER: &str = "org.freedesktop.UPower";
@@ -77,61 +87,6 @@ impl Issued {
     }
 }
 
-/// Show `warning`, in place of `replaces` if given. A new notification goes
-/// to whoever owns the service (which may start it on demand), a
-/// replacement to the instance that issued the id.
-pub(crate) async fn notify(
-    session: &Connection,
-    warning: &Warning,
-    replaces: Option<&Issued>,
-) -> zbus::Result<Issued> {
-    let destination = replaces.map_or(NOTIFICATIONS, |issued| issued.owner.as_str());
-    let actions: &[&str] = &[];
-    let reply = session
-        .call_method(
-            Some(destination),
-            NOTIFICATIONS_PATH,
-            Some(NOTIFICATIONS),
-            "Notify",
-            &(
-                APP_NAME,
-                replaces.map_or(0, |issued| issued.id),
-                warning.icon,
-                &warning.summary,
-                &warning.body,
-                actions,
-                warning.hints(),
-                warning.timeout_ms,
-            ),
-        )
-        .await?;
-    let id = reply.body::<u32>()?;
-    // The instance that answered, whichever owned the name by then.
-    let owner = reply
-        .header()?
-        .sender()?
-        .ok_or_else(|| zbus::Error::Failure("Notify reply without a sender".into()))?
-        .to_owned()
-        .into();
-    Ok(Issued { owner, id })
-}
-
-/// Close a notification, through the instance that issued it.
-pub(crate) async fn close(session: &Connection, issued: &Issued) {
-    if let Err(e) = session
-        .call_method(
-            Some(issued.owner.as_str()),
-            NOTIFICATIONS_PATH,
-            Some(NOTIFICATIONS),
-            "CloseNotification",
-            &issued.id,
-        )
-        .await
-    {
-        g_log!(glib::LogLevel::Debug, "Cannot close notification: {e}");
-    }
-}
-
 /// What the notification service tells a source of warnings.
 #[derive(Debug)]
 pub(crate) enum ServiceEvent {
@@ -147,14 +102,21 @@ pub(crate) enum ServiceEvent {
     Closed(Issued),
 }
 
+/// What comes in from the session bus for the notifications.
+enum Incoming {
+    Service(ServiceEvent),
+    /// A method return or an error: maybe the answer to a `Notify` call.
+    Reply(Arc<Message>),
+}
+
 /// Who owns the notification service right now, and the changes to come,
-/// in the order the bus delivered them. Subscribed before asking, so no
-/// change slips through.
-pub(crate) async fn service_events(
+/// with the answers to the calls, all in the order the bus delivered them.
+/// Subscribed before asking, so no change slips through.
+async fn incoming(
     session: &Connection,
 ) -> zbus::Result<(
     Option<OwnedUniqueName>,
-    Pin<Box<dyn Stream<Item = ServiceEvent>>>,
+    Pin<Box<dyn Stream<Item = Incoming>>>,
 )> {
     let dbus = DBusProxy::new(session).await?;
     let owners = OrderedStreamExt::filter_map(
@@ -162,13 +124,13 @@ pub(crate) async fn service_events(
             .await?,
         |signal| {
             let args = signal.args().ok()?;
-            Some(ServiceEvent::Owner {
+            Some(Incoming::Service(ServiceEvent::Owner {
                 gone: args.old_owner().as_ref().map(|gone| gone.to_owned().into()),
                 owner: args
                     .new_owner()
                     .as_ref()
                     .map(|owner| owner.to_owned().into()),
-            })
+            }))
         },
     );
     let closed = OrderedStreamExt::filter_map(
@@ -179,8 +141,34 @@ pub(crate) async fn service_events(
         |signal| {
             let id = signal.args().ok()?.id;
             let owner = signal.header().ok()?.sender().ok()??.to_owned().into();
-            Some(ServiceEvent::Closed(Issued { owner, id }))
+            Some(Incoming::Service(ServiceEvent::Closed(Issued {
+                owner,
+                id,
+            })))
         },
+    );
+    // The replies this connection receives; the calls they answer are told
+    // by their serial numbers. (Rules for replies stay on this side: the
+    // bus is not asked for anything. Naming the destination keeps them
+    // apart from the rules zbus has for its own calls.)
+    let me = session
+        .unique_name()
+        .ok_or_else(|| zbus::Error::Failure("No unique name on the session bus".into()))?;
+    let returns = MatchRule::builder()
+        .msg_type(MessageType::MethodReturn)
+        .destination(me.as_ref())?
+        .build();
+    let returns = OrderedStreamExt::filter_map(
+        MessageStream::for_match_rule(returns, session, Some(MAX_QUEUED_REPLIES)).await?,
+        |reply| Some(Incoming::Reply(reply.ok()?)),
+    );
+    let errors = MatchRule::builder()
+        .msg_type(MessageType::Error)
+        .destination(me.as_ref())?
+        .build();
+    let errors = OrderedStreamExt::filter_map(
+        MessageStream::for_match_rule(errors, session, Some(MAX_QUEUED_REPLIES)).await?,
+        |reply| Some(Incoming::Reply(reply.ok()?)),
     );
     let owner = dbus
         .get_name_owner(WellKnownName::from_static_str_unchecked(NOTIFICATIONS).into())
@@ -188,7 +176,13 @@ pub(crate) async fn service_events(
         .ok();
     Ok((
         owner,
-        Box::pin(ordered_stream::join(owners, closed).into_stream()),
+        Box::pin(
+            ordered_stream::join(
+                ordered_stream::join(owners, closed),
+                ordered_stream::join(returns, errors),
+            )
+            .into_stream(),
+        ),
     ))
 }
 
@@ -205,69 +199,137 @@ pub(crate) enum Outcome {
     Lost,
 }
 
+/// Stands for a `Notify` call until its answer comes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Token(u64);
+
+/// What the notification service tells a source of warnings, in the order
+/// the bus delivered it.
+#[derive(Debug)]
+pub(crate) enum Notice {
+    Service(ServiceEvent),
+    /// What became of the warning [`Notifier::notify`] returned the token
+    /// for.
+    Answer(Token, zbus::Result<Outcome>),
+}
+
+/// A `Notify` call that has not been answered yet.
+struct Call {
+    token: Token,
+    /// The ids the service closed by itself since the call went out: an
+    /// answer that carries one of them is dead on arrival.
+    closed: Vec<Issued>,
+}
+
 /// The notification service, as a source of warnings talks to it.
 ///
-/// While a call is outstanding the service's events keep coming in: an
-/// answer that takes long never holds up the news that an id died. The
-/// source applies those events ([`Notifier::ready`]) before its next step,
-/// an answer is checked against them, and an id is only replaced or closed
-/// while it is still live.
+/// A call goes out at once and its answer comes in later, as a [`Notice`]
+/// among the service's news: an answer that takes long holds up nothing
+/// else, neither the news that an id died nor the source's other warnings.
+/// The source applies the notices in order ([`Notifier::ready`]) before its
+/// next step, an answer is checked against the news that came before it,
+/// and an id is only replaced or closed while it is still live.
 pub(crate) struct Notifier<'a> {
     session: &'a Connection,
-    events: Fuse<Pin<Box<dyn Stream<Item = ServiceEvent>>>>,
-    /// Events that came in and that the source has not applied yet.
-    taken: VecDeque<ServiceEvent>,
-    /// Who owns the service, as of the latest event that came in.
+    incoming: Fuse<Pin<Box<dyn Stream<Item = Incoming>>>>,
+    /// Notices that came in and that the source has not applied yet.
+    taken: VecDeque<Notice>,
+    /// Who owns the service, as of the latest news that came in.
     owner: Option<OwnedUniqueName>,
+    /// The calls that wait for their answer, by serial number.
+    calls: HashMap<u32, Call>,
+    next_token: u64,
 }
 
 impl<'a> Notifier<'a> {
-    /// Subscribe to the notification service's events.
+    /// Subscribe to the notification service's news.
     pub(crate) async fn new(session: &'a Connection) -> zbus::Result<Notifier<'a>> {
-        let (owner, events) = service_events(session).await?;
+        let (owner, incoming) = incoming(session).await?;
         Ok(Notifier {
             session,
-            events: events.fuse(),
+            incoming: incoming.fuse(),
             taken: VecDeque::new(),
             owner,
+            calls: HashMap::new(),
+            next_token: 0,
         })
     }
 
-    fn take(&mut self, event: ServiceEvent) {
-        if let ServiceEvent::Owner { owner, .. } = &event {
-            self.owner = owner.clone();
+    fn take(&mut self, incoming: Incoming) {
+        match incoming {
+            Incoming::Service(event) => {
+                match &event {
+                    ServiceEvent::Owner { owner, .. } => self.owner = owner.clone(),
+                    ServiceEvent::Closed(closed) => {
+                        for call in self.calls.values_mut() {
+                            call.closed.push(closed.clone());
+                        }
+                    }
+                }
+                self.taken.push_back(Notice::Service(event));
+            }
+            Incoming::Reply(reply) => {
+                let Some(call) = reply
+                    .reply_serial()
+                    .and_then(|serial| self.calls.remove(&serial))
+                else {
+                    return;
+                };
+                let outcome = self.outcome(&reply, &call.closed);
+                self.taken.push_back(Notice::Answer(call.token, outcome));
+            }
         }
-        self.taken.push_back(event);
     }
 
-    /// Take in the events that have arrived.
+    /// What became of a warning, by the answer to its call and the news
+    /// that came in before.
+    fn outcome(&self, reply: &Arc<Message>, closed: &[Issued]) -> zbus::Result<Outcome> {
+        if reply.message_type() == MessageType::Error {
+            return Err(zbus::Error::from(reply.clone()));
+        }
+        let id = reply.body::<u32>()?;
+        // The instance that answered, whichever owned the name by then.
+        let owner = reply
+            .header()?
+            .sender()?
+            .ok_or_else(|| zbus::Error::Failure("Notify reply without a sender".into()))?
+            .to_owned()
+            .into();
+        let issued = Issued { owner, id };
+        Ok(if closed.contains(&issued) {
+            Outcome::Closed
+        } else if self.owner.as_ref() != Some(&issued.owner) {
+            Outcome::Lost
+        } else {
+            Outcome::Up(issued)
+        })
+    }
+
+    /// Take in what has arrived.
     fn take_arrived(&mut self) {
-        while let Some(Some(event)) = self.events.next().now_or_never() {
-            self.take(event);
+        while let Some(Some(incoming)) = self.incoming.next().now_or_never() {
+            self.take(incoming);
         }
     }
 
-    /// The next event to apply, if one has arrived, in the order the bus
+    /// The next notice to apply, if one has arrived, in the order the bus
     /// delivered them.
-    pub(crate) fn ready(&mut self) -> Option<ServiceEvent> {
+    pub(crate) fn ready(&mut self) -> Option<Notice> {
         self.take_arrived();
         self.taken.pop_front()
     }
 
-    /// Wait for the next event to apply. Never ends: when the service's
-    /// events end, there is no more news.
-    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<ServiceEvent> {
-        if let Some(event) = self.taken.pop_front() {
-            return Poll::Ready(event);
-        }
-        match self.events.poll_next_unpin(cx) {
-            Poll::Ready(Some(event)) => {
-                if let ServiceEvent::Owner { owner, .. } = &event {
-                    self.owner = owner.clone();
-                }
-                Poll::Ready(event)
+    /// Wait for the next notice to apply. Never ends: when the service's
+    /// news ends, there is no more news.
+    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Notice> {
+        loop {
+            if let Some(notice) = self.taken.pop_front() {
+                return Poll::Ready(notice);
             }
-            _ => Poll::Pending,
+            match self.incoming.poll_next_unpin(cx) {
+                Poll::Ready(Some(incoming)) => self.take(incoming),
+                _ => return Poll::Pending,
+            }
         }
     }
 
@@ -277,58 +339,70 @@ impl<'a> Notifier<'a> {
     pub(crate) fn is_live(&mut self, issued: &Issued) -> bool {
         self.take_arrived();
         self.owner.as_ref() == Some(&issued.owner)
-            && !self
-                .taken
-                .iter()
-                .any(|event| matches!(event, ServiceEvent::Closed(closed) if closed == issued))
+            && !self.taken.iter().any(|notice| {
+                matches!(notice, Notice::Service(ServiceEvent::Closed(closed)) if closed == issued)
+            })
     }
 
-    /// Wait for `call`, taking in the service's events meanwhile.
-    async fn during<T>(&mut self, call: impl Future<Output = T>) -> T {
-        let mut call = pin!(call);
-        let output = poll_fn(|cx| {
-            while let Poll::Ready(Some(event)) = self.events.poll_next_unpin(cx) {
-                self.take(event);
-            }
-            call.as_mut().poll(cx)
-        })
-        .await;
-        // The bus delivers in order: what came before the answer has
-        // arrived by now.
-        self.take_arrived();
-        output
-    }
-
-    /// Show `warning`, in place of `replaces` while that is live; a dead id
-    /// is never sent, the warning is shown afresh instead.
+    /// Send `warning`, in place of `replaces` while that is live; a dead id
+    /// is never sent, the warning is shown afresh instead. A new
+    /// notification goes to whoever owns the service (which may start it
+    /// on demand), a replacement to the instance that issued the id. The
+    /// answer comes in later, as a [`Notice::Answer`] with the token
+    /// returned here.
     pub(crate) async fn notify(
         &mut self,
         warning: &Warning,
         replaces: Option<&Issued>,
-    ) -> zbus::Result<Outcome> {
+    ) -> zbus::Result<Token> {
+        // News that came in before the call is no news about its answer.
+        self.take_arrived();
         let replaces = replaces.filter(|issued| self.is_live(issued));
-        let session = self.session;
-        let issued = self.during(notify(session, warning, replaces)).await?;
-        Ok(if !self.is_live(&issued) {
-            let closed = self
-                .taken
-                .iter()
-                .any(|event| matches!(event, ServiceEvent::Closed(closed) if *closed == issued));
-            if closed {
-                Outcome::Closed
-            } else {
-                Outcome::Lost
-            }
-        } else {
-            Outcome::Up(issued)
-        })
+        let destination = replaces.map_or(NOTIFICATIONS, |issued| issued.owner.as_str());
+        let actions: &[&str] = &[];
+        let call = MessageBuilder::method_call(NOTIFICATIONS_PATH, "Notify")?
+            .destination(destination)?
+            .interface(NOTIFICATIONS)?
+            .build(&(
+                APP_NAME,
+                replaces.map_or(0, |issued| issued.id),
+                warning.icon,
+                &warning.summary,
+                &warning.body,
+                actions,
+                warning.hints(),
+                warning.timeout_ms,
+            ))?;
+        let serial = self.session.send_message(call).await?;
+        let token = Token(self.next_token);
+        self.next_token += 1;
+        self.calls.insert(
+            serial,
+            Call {
+                token,
+                closed: Vec::new(),
+            },
+        );
+        Ok(token)
     }
 
-    /// Close `issued`, unless it is dead already.
+    /// Close `issued`, through the instance that issued it, unless it is
+    /// dead already. Nothing waits for the answer.
     pub(crate) async fn close(&mut self, issued: &Issued) {
-        if self.is_live(issued) {
-            let session = self.session;
-            self.during(close(session, issued)).await;
+        if !self.is_live(issued) {
+            return;
+        }
+        let sent = async {
+            let call = MessageBuilder::method_call(NOTIFICATIONS_PATH, "CloseNotification")?
+                .destination(issued.owner.as_str())?
+                .interface(NOTIFICATIONS)?
+                .with_flags(MessageFlags::NoReplyExpected)?
+                .build(&issued.id)?;
+            self.session.send_message(call).await
+        }
+        .await;
+        if let Err(e) = sent {
+            g_log!(glib::LogLevel::Debug, "Cannot close notification: {e}");
         }
     }
 }
@@ -522,7 +596,7 @@ pub fn warning(
 }
 
 /// The display device's properties that decide its warning.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Display {
     kind: u32,
     warning_level: u32,
@@ -597,6 +671,24 @@ enum Update {
     Started,
 }
 
+/// The warning for a new level, sent and not answered yet.
+struct Showing {
+    token: Token,
+    level: Level,
+    body: String,
+}
+
+/// An update of the discharging warning on screen, sent and not answered
+/// yet.
+struct Updating {
+    token: Token,
+    /// The notification it updates in place.
+    replaces: Issued,
+    /// Whether the level changed since: the update is out of date, and the
+    /// notification it updates went away with the old level.
+    outdated: bool,
+}
+
 /// Which level is on screen, so each level is announced once.
 struct Tracker {
     level: Level,
@@ -605,9 +697,19 @@ struct Tracker {
     shown: Option<Issued>,
     /// The body of the discharging warning on screen, which follows the UPS.
     body: String,
-    /// Whether to act on the display device again: it changed, or a
-    /// notification service appeared.
+    /// Whether to act on the display device again: a notification service
+    /// appeared.
     due: bool,
+    /// The warning for a new level, until its answer comes in. What the
+    /// display device reports meanwhile waits for it, in order: the next
+    /// step may have to replace or close it.
+    showing: Option<Showing>,
+    /// The updates of the discharging warning that are not answered yet.
+    /// Nothing waits for them: the id they update is known.
+    updating: Vec<Updating>,
+    /// What the display device reported and is still to be acted on, in
+    /// the order UPower sent it.
+    queued: VecDeque<Display>,
 }
 
 impl Tracker {
@@ -625,7 +727,11 @@ impl Tracker {
             return;
         }
         // Like gnome-settings-daemon: the previous warning goes away when
-        // the level changes, and a new one replaces it.
+        // the level changes, and a new one replaces it. Updates of it that
+        // are still under way are out of date.
+        for updating in &mut self.updating {
+            updating.outdated = true;
+        }
         if let Some(shown) = self.shown.take() {
             notifier.close(&shown).await;
         }
@@ -641,17 +747,13 @@ impl Tracker {
             return;
         };
         match notifier.notify(&warning, None).await {
-            Ok(Outcome::Up(shown)) => {
-                self.level = level;
-                self.shown = Some(shown);
-                self.body = warning.body;
+            Ok(token) => {
+                self.showing = Some(Showing {
+                    token,
+                    level,
+                    body: warning.body,
+                })
             }
-            // Dismissed before the answer came: like a warning the server
-            // closed later, it stays down.
-            Ok(Outcome::Closed) => self.level = level,
-            // The instance that took it lost the service: shown again when
-            // the next one appears.
-            Ok(Outcome::Lost) => {}
             // Retried on the next battery update, and when a notification
             // service appears: at login it may start after this daemon.
             Err(e) => g_log!(glib::LogLevel::Warning, "Cannot show battery warning: {e}"),
@@ -681,14 +783,13 @@ impl Tracker {
             return;
         }
         match notifier.notify(&warning, Some(shown)).await {
-            Ok(Outcome::Up(shown)) => {
-                self.shown = Some(shown);
+            Ok(token) => {
+                self.updating.push(Updating {
+                    token,
+                    replaces: shown.clone(),
+                    outdated: false,
+                });
                 self.body = warning.body;
-            }
-            Ok(Outcome::Closed) => self.shown = None,
-            Ok(Outcome::Lost) => {
-                self.shown = None;
-                self.level = Level::None;
             }
             // Retried on the next update.
             Err(e) => g_log!(
@@ -699,6 +800,73 @@ impl Tracker {
     }
 
     /// Apply what the notification service tells.
+    async fn notice(&mut self, notice: Notice, notifier: &mut Notifier<'_>) {
+        match notice {
+            Notice::Service(event) => self.service(event),
+            Notice::Answer(token, answer) => self.answered(token, answer, notifier).await,
+        }
+    }
+
+    /// Apply the answer to a warning that was sent.
+    async fn answered(
+        &mut self,
+        token: Token,
+        answer: zbus::Result<Outcome>,
+        notifier: &mut Notifier<'_>,
+    ) {
+        match self.showing.take() {
+            Some(showing) if showing.token == token => {
+                match answer {
+                    Ok(Outcome::Up(shown)) => {
+                        self.level = showing.level;
+                        self.shown = Some(shown);
+                        self.body = showing.body;
+                    }
+                    // Dismissed before the answer came: like a warning the
+                    // server closed later, it stays down.
+                    Ok(Outcome::Closed) => self.level = showing.level,
+                    // The instance that took it lost the service: shown
+                    // again when the next one appears.
+                    Ok(Outcome::Lost) => {}
+                    // Retried on the next battery update, and when a
+                    // notification service appears.
+                    Err(e) => g_log!(glib::LogLevel::Warning, "Cannot show battery warning: {e}"),
+                }
+                return;
+            }
+            showing => self.showing = showing,
+        }
+        let Some(index) = self.updating.iter().position(|u| u.token == token) else {
+            return;
+        };
+        let updating = self.updating.remove(index);
+        match answer {
+            // The service may have put the update up under another id.
+            Ok(Outcome::Up(issued)) if !updating.outdated => self.shown = Some(issued),
+            // Out of date: the notification it updated went away with the
+            // old level, and one the service put up afresh instead goes too.
+            Ok(Outcome::Up(issued)) => {
+                if issued != updating.replaces && self.shown.as_ref() != Some(&issued) {
+                    notifier.close(&issued).await;
+                }
+            }
+            // The news before the answer said it already: the id died, or
+            // the service changed hands.
+            Ok(Outcome::Closed | Outcome::Lost) => {}
+            Err(e) => {
+                g_log!(
+                    glib::LogLevel::Warning,
+                    "Cannot update battery warning: {e}"
+                );
+                // Retried on the next update.
+                if !updating.outdated {
+                    self.body.clear();
+                }
+            }
+        }
+    }
+
+    /// Apply what the notification service tells of itself.
     fn service(&mut self, event: ServiceEvent) {
         match event {
             // The server closed a notification by itself (it expired, or the
@@ -747,6 +915,9 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
         shown: None,
         body: String::new(),
         due: true,
+        showing: None,
+        updating: Vec::new(),
+        queued: VecDeque::new(),
     };
 
     // Subscribe before reading, so that no change slips through. Each
@@ -785,35 +956,43 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
     let mut updates = ordered_stream::join(changes, started).into_stream();
     let mut display = Display::read(&device).await?;
     loop {
-        // The notification service's news first: which ids died, and
-        // whether a service appeared.
-        while let Some(event) = notifier.ready() {
-            tracker.service(event);
+        // The notification service's news first: which ids died, whether a
+        // service appeared, and the answers that came in.
+        while let Some(notice) = notifier.ready() {
+            tracker.notice(notice, &mut notifier).await;
         }
-        if tracker.due {
-            tracker.due = false;
-            tracker.update(&display, &upower, &mut notifier).await;
-            continue;
+        // Until a new warning's answer is in, the display device's changes
+        // wait for it, in order.
+        if tracker.showing.is_none() {
+            if let Some(reported) = tracker.queued.pop_front() {
+                tracker.update(&reported, &upower, &mut notifier).await;
+                continue;
+            }
+            if tracker.due {
+                tracker.due = false;
+                tracker.update(&display, &upower, &mut notifier).await;
+                continue;
+            }
         }
         let next = poll_fn(|cx| {
-            if let Poll::Ready(event) = notifier.poll_next(cx) {
-                return Poll::Ready(Err(event));
+            if let Poll::Ready(notice) = notifier.poll_next(cx) {
+                return Poll::Ready(Err(notice));
             }
             updates.poll_next_unpin(cx).map(Ok)
         })
         .await;
         match next {
-            Err(event) => tracker.service(event),
+            Err(notice) => tracker.notice(notice, &mut notifier).await,
             Ok(None) => return Ok(()),
             Ok(Some(Update::Changed(changed, invalidated))) => {
                 display.apply(&changed, &invalidated, &device).await;
-                tracker.due = true;
+                tracker.queued.push_back(display.clone());
             }
             // A new UPower may report other values than its predecessor.
             Ok(Some(Update::Started)) => match Display::read(&device).await {
                 Ok(read) => {
                     display = read;
-                    tracker.due = true;
+                    tracker.queued.push_back(display.clone());
                 }
                 Err(e) => g_log!(glib::LogLevel::Debug, "Cannot read the display device: {e}"),
             },
@@ -846,7 +1025,7 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Command, Stdio};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use zbus::export::futures_util::lock::Mutex as Gate;
@@ -1051,19 +1230,20 @@ pub(crate) mod tests {
     }
 
     /// A notification server that records what it is asked to do, and
-    /// holds back its answers to `Notify` while `gate` is locked.
+    /// holds back its answers to `Notify` while `gate` is locked. Its other
+    /// calls go on meanwhile.
     struct FakeNotifications {
         log: Arc<Mutex<Vec<String>>>,
         calls: Calls,
         gate: Arc<Gate<()>>,
-        next_id: u32,
+        next_id: AtomicU32,
     }
 
     #[dbus_interface(name = "org.freedesktop.Notifications")]
     impl FakeNotifications {
         #[allow(clippy::too_many_arguments)]
         async fn notify(
-            &mut self,
+            &self,
             _app_name: &str,
             replaces_id: u32,
             _app_icon: &str,
@@ -1078,8 +1258,7 @@ pub(crate) mod tests {
                 _ => 255,
             };
             let id = if replaces_id == 0 {
-                self.next_id += 1;
-                self.next_id
+                self.next_id.fetch_add(1, Ordering::SeqCst) + 1
             } else {
                 replaces_id
             };
@@ -1101,7 +1280,7 @@ pub(crate) mod tests {
             let _open = self.gate.lock().await;
             id
         }
-        fn close_notification(&mut self, id: u32) {
+        fn close_notification(&self, id: u32) {
             self.log.lock().unwrap().push(format!("close {id}"));
             self.calls.lock().unwrap().push(Call::Close(id));
         }
@@ -1242,7 +1421,7 @@ pub(crate) mod tests {
                         log: log.clone(),
                         calls: Calls::default(),
                         gate: Arc::default(),
-                        next_id: 0,
+                        next_id: AtomicU32::new(0),
                     },
                 )?
                 .build()
@@ -1321,7 +1500,7 @@ pub(crate) mod tests {
                         log: log.clone(),
                         calls: Calls::default(),
                         gate: Arc::default(),
-                        next_id: 0,
+                        next_id: AtomicU32::new(0),
                     },
                 )?
                 .build()
@@ -1378,7 +1557,7 @@ pub(crate) mod tests {
                         log: log.clone(),
                         calls: Calls::default(),
                         gate: Arc::default(),
-                        next_id: 0,
+                        next_id: AtomicU32::new(0),
                     },
                 )?
                 .build()
@@ -1418,7 +1597,7 @@ pub(crate) mod tests {
                         log: log.clone(),
                         calls: Calls::default(),
                         gate: Arc::default(),
-                        next_id: 0,
+                        next_id: AtomicU32::new(0),
                     },
                 )?
                 .build()
@@ -1548,7 +1727,7 @@ pub(crate) mod tests {
                 log: self.log.clone(),
                 calls,
                 gate: self.gate.clone(),
-                next_id: 0,
+                next_id: AtomicU32::new(0),
             };
             self.notifications = Some(
                 zbus::block_on(async {
@@ -1757,6 +1936,43 @@ pub(crate) mod tests {
             log,
             &["notify 2 UPS Almost Empty: 70% UPS power remaining (urgency 2)"],
         );
+        world.burst(&[&[("WarningLevel", Value::U32(1))]]);
+        world.expect(log, &["close 2"]);
+    }
+
+    /// While the server holds back its answer to an update of the UPS
+    /// warning, the UPS runs low: the warning goes and the new one comes at
+    /// once, and the late answer changes nothing.
+    #[test]
+    fn a_slow_update_holds_up_nothing() {
+        let world = World::new(FakeDevice {
+            kind: KIND_UPS,
+            warning_level: 2,
+            percentage: 80.0,
+            time_to_empty: 600,
+        });
+        let log = &mut Vec::new();
+        world.expect(
+            log,
+            &["notify 1 UPS Discharging: 10 minutes of UPS backup power remaining (80%) (urgency 1)"],
+        );
+        let gate = world.gate.clone();
+        let held = zbus::block_on(gate.lock());
+        world.burst(&[&[("Percentage", Value::F64(70.0))]]);
+        world.expect(
+            log,
+            &["notify 1 (replaces 1) UPS Discharging: 10 minutes of UPS backup power remaining (70%) (urgency 1)"],
+        );
+        world.burst(&[&[("WarningLevel", Value::U32(3))]]);
+        world.expect(
+            log,
+            &[
+                "close 1",
+                "notify 2 UPS Low: 70% UPS power remaining (urgency 1)",
+            ],
+        );
+        drop(held);
+        world.expect(log, &[]);
         world.burst(&[&[("WarningLevel", Value::U32(1))]]);
         world.expect(log, &["close 2"]);
     }
