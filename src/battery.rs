@@ -226,8 +226,8 @@ pub fn time_text(seconds: i64) -> String {
 }
 
 /// The notification for a level, with the texts gnome-settings-daemon uses,
-/// so both sessions warn alike. `time_to_empty` (seconds, 0 for unknown) is
-/// reported while a UPS discharges; `critical_action` is what UPower does at
+/// so both sessions warn alike. `time_to_empty` (seconds, 0 or less for
+/// unknown) is reported while a UPS discharges; `critical_action` is what UPower does at
 /// the action level (`GetCriticalAction`).
 pub fn warning(
     level: Level,
@@ -240,7 +240,7 @@ pub fn warning(
     let (summary, body, icon, urgency, timeout_ms) = match level {
         Level::None => return None,
         Level::Discharging => {
-            let remaining = if time_to_empty == 0 {
+            let remaining = if time_to_empty <= 0 {
                 "Unknown amount".to_string()
             } else {
                 time_text(time_to_empty)
@@ -693,6 +693,13 @@ pub(crate) mod tests {
                 .unwrap()
                 .body,
             "Unknown amount of UPS backup power remaining (20%)"
+        );
+        // A UPS that cannot tell may report a negative time, too.
+        assert_eq!(
+            warning(Level::Discharging, KIND_UPS, 55.0, -1, "")
+                .unwrap()
+                .body,
+            "Unknown amount of UPS backup power remaining (55%)"
         );
     }
 
