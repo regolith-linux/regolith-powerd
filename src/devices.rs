@@ -194,12 +194,21 @@ impl State {
 }
 
 /// What tells devices apart across reconnections: the serial number, or the
-/// object path for a device without one.
-fn identity(serial: &str, path: &OwnedObjectPath) -> String {
-    if serial.is_empty() {
-        path.as_str().to_string()
-    } else {
-        serial.to_string()
+/// object path for a device without one. A serial never stands for a path,
+/// even one that reads the same.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Identity {
+    Serial(String),
+    Path(OwnedObjectPath),
+}
+
+impl Identity {
+    fn of(serial: &str, path: &OwnedObjectPath) -> Identity {
+        if serial.is_empty() {
+            Identity::Path(path.clone())
+        } else {
+            Identity::Serial(serial.to_string())
+        }
     }
 }
 
@@ -245,7 +254,7 @@ struct Followed {
 #[derive(Default)]
 struct Warnings {
     /// The highest severity announced per identity. Outlives the device.
-    announced: HashMap<String, Severity>,
+    announced: HashMap<Identity, Severity>,
 }
 
 /// What to do with a device's notification.
@@ -261,7 +270,7 @@ enum Action {
 }
 
 impl Warnings {
-    fn update(&self, identity: &str, change: Change) -> Action {
+    fn update(&self, identity: &Identity, change: Change) -> Action {
         match change {
             Change::Keep => Action::Nothing,
             Change::Recovered => Action::Close,
@@ -276,12 +285,12 @@ impl Warnings {
     }
 
     /// The device is fine again: the next low level warns again.
-    fn recovered(&mut self, identity: &str) {
+    fn recovered(&mut self, identity: &Identity) {
         self.announced.remove(identity);
     }
 
     /// The notification server accepted a warning of this severity.
-    fn accepted(&mut self, identity: String, severity: Severity) {
+    fn accepted(&mut self, identity: Identity, severity: Severity) {
         let announced = self.announced.entry(identity).or_insert(severity);
         *announced = (*announced).max(severity);
     }
@@ -404,7 +413,7 @@ impl Watcher<'_> {
             return;
         };
         let state = &followed.state;
-        let identity = identity(&state.serial, path);
+        let identity = Identity::of(&state.serial, path);
         let action = if state.is_peripheral() {
             self.warnings
                 .update(&identity, Change::from_upower(state.warning_level))
@@ -471,7 +480,7 @@ impl Watcher<'_> {
                     pending: None,
                 };
                 if shown.pending.is_some() {
-                    let identity = identity(&state.serial, path);
+                    let identity = Identity::of(&state.serial, path);
                     self.warnings.accepted(identity, severity);
                 }
             }
@@ -730,20 +739,27 @@ mod tests {
         );
     }
 
+    fn serial(serial: &str) -> Identity {
+        Identity::Serial(serial.into())
+    }
+
     #[test]
     fn serial_or_path_identifies_a_device() {
         let path = OwnedObjectPath::try_from("/org/freedesktop/UPower/devices/mouse").unwrap();
-        assert_eq!(identity("M1", &path), "M1");
-        assert_eq!(identity("", &path), path.as_str());
+        assert_eq!(Identity::of("M1", &path), serial("M1"));
+        assert_eq!(Identity::of("", &path), Identity::Path(path.clone()));
+        // A serial that reads like another device's path is still a serial.
+        assert_ne!(Identity::of(path.as_str(), &path), Identity::of("", &path));
     }
 
     /// Feed `change` and, when it asks for a warning, let the server accept
     /// it (or not).
     fn step(warnings: &mut Warnings, identity: &str, change: Change, accept: bool) -> Action {
-        let action = warnings.update(identity, change);
+        let identity = serial(identity);
+        let action = warnings.update(&identity, change);
         match action {
-            Action::Close => warnings.recovered(identity),
-            Action::Show(severity) if accept => warnings.accepted(identity.into(), severity),
+            Action::Close => warnings.recovered(&identity),
+            Action::Show(severity) if accept => warnings.accepted(identity, severity),
             _ => {}
         }
         action
@@ -1348,5 +1364,41 @@ mod tests {
     #[test]
     fn levels_reported_before_a_removal_count_when_the_device_returns() {
         burst_before_removal(true);
+    }
+
+    /// A serial that reads like another device's object path does not make
+    /// the two one device.
+    #[test]
+    fn a_serial_never_stands_for_a_path() {
+        let world = World::new(
+            &[
+                (
+                    MOUSE,
+                    State {
+                        serial: KEYBOARD.into(),
+                        ..mouse(3, 9.0)
+                    },
+                ),
+                (
+                    KEYBOARD,
+                    State {
+                        kind: 6,
+                        warning_level: 3,
+                        percentage: 8.0,
+                        battery_level: 1,
+                        serial: String::new(),
+                    },
+                ),
+            ],
+            true,
+        );
+        // Followed in the order UPower lists them.
+        world.expect(
+            &mut Vec::new(),
+            &[
+                &format!("notify 1 replaces 0 {MOUSE_LOW} (9%)"),
+                "notify 2 replaces 0 Keyboard battery low: Wireless keyboard is low on power (8%)",
+            ],
+        );
     }
 }
