@@ -19,13 +19,13 @@
 use glib::g_log;
 use std::collections::HashMap;
 use std::pin::Pin;
-use zbus::export::futures_util::stream::{self, AbortHandle, SelectAll, Stream};
+use zbus::export::futures_util::stream::{self, SelectAll, Stream};
 use zbus::export::futures_util::StreamExt;
 use zbus::export::ordered_stream::{self, OrderedStreamExt};
-use zbus::fdo::{DBusProxy, PropertiesProxy};
+use zbus::fdo::{DBusProxy, PropertiesChanged, PropertiesProxy};
 use zbus::names::InterfaceName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
-use zbus::Connection;
+use zbus::{Connection, MatchRule, MessageStream, MessageType};
 
 use crate::battery::{
     service_events, NotificationsProxy, ServiceEvent, UPowerProxy, Warning, APP_NAME,
@@ -34,6 +34,10 @@ use crate::battery::{
 const UPOWER: &str = "org.freedesktop.UPower";
 const DEVICE_INTERFACE: &str = "org.freedesktop.UPower.Device";
 const RETRY_SECS: u32 = 5;
+/// How many device property changes may wait while the daemon is busy
+/// (zbus's default is 64). They are shared by all devices, and the system
+/// bus stalls once they are queued up.
+const MAX_QUEUED_CHANGES: usize = 1024;
 
 /// The device properties that decide a warning.
 const PROPERTIES: [&str; 5] = [
@@ -233,8 +237,6 @@ struct Shown {
 /// A device being followed.
 struct Followed {
     properties: PropertiesProxy<'static>,
-    /// Ends the subscription to the device's property changes.
-    changes: AbortHandle,
     state: State,
     shown: Shown,
 }
@@ -298,7 +300,7 @@ struct Watcher<'a> {
 impl Watcher<'_> {
     /// Read UPower's devices, after a start or restart. Devices that are
     /// gone are dropped, the others followed afresh.
-    async fn enumerate(&mut self, events: &mut Events) {
+    async fn enumerate(&mut self) {
         let paths = match self.upower.enumerate_devices().await {
             Ok(paths) => paths,
             Err(e) => {
@@ -316,80 +318,36 @@ impl Watcher<'_> {
             self.remove(&path).await;
         }
         for path in paths {
-            self.follow(path, events).await;
+            self.follow(path).await;
         }
     }
 
-    /// Follow the device at `path`: subscribe to its changes, then read it.
-    async fn follow(&mut self, path: OwnedObjectPath, events: &mut Events) {
+    /// Follow the device at `path`, or follow it afresh: read all of it. Its
+    /// changes come in through the subscription [`watch`] holds for every
+    /// device, so none is missed.
+    async fn follow(&mut self, path: OwnedObjectPath) {
         let shown = self
             .followed
             .remove(&path)
-            .map(|old| {
-                old.changes.abort();
-                old.shown
-            })
+            .map(|old| old.shown)
             .unwrap_or_default();
-        let subscribed = async {
+        let read = async {
             let properties = PropertiesProxy::builder(self.system)
                 .destination(UPOWER)?
                 .path(path.clone())?
                 .cache_properties(zbus::CacheProperties::No)
                 .build()
                 .await?;
-            let changes = properties.receive_properties_changed().await?;
-            zbus::Result::Ok((properties, changes))
+            let all = properties
+                .get_all(InterfaceName::from_static_str_unchecked(DEVICE_INTERFACE))
+                .await?;
+            zbus::Result::Ok((properties, State::from_properties(&all)))
         }
         .await;
-        let (properties, changes) = match subscribed {
-            Ok(subscribed) => subscribed,
-            Err(e) => {
-                g_log!(
-                    glib::LogLevel::Debug,
-                    "Cannot follow {}: {e}",
-                    path.as_str()
-                );
-                return;
-            }
-        };
-        let changed_path = path.clone();
-        let changes = StreamExt::filter_map(changes, move |signal| {
-            let path = changed_path.clone();
-            async move {
-                let args = signal.args().ok()?;
-                if args.interface_name().as_str() != DEVICE_INTERFACE {
-                    return None;
-                }
-                let changed = args
-                    .changed_properties()
-                    .iter()
-                    .map(|(name, value)| (name.to_string(), OwnedValue::from(value)))
-                    .collect();
-                let invalidated = args
-                    .invalidated_properties()
-                    .iter()
-                    .map(|name| name.to_string())
-                    .collect();
-                Some(Event::Changed(
-                    path,
-                    Changes {
-                        changed,
-                        invalidated,
-                    },
-                ))
-            }
-        });
-        let (changes, abort) = stream::abortable(changes);
-        events.push(Box::pin(changes));
-        // All of it, after subscribing: no change is missed.
-        let state = match properties
-            .get_all(InterfaceName::from_static_str_unchecked(DEVICE_INTERFACE))
-            .await
-        {
-            Ok(properties) => State::from_properties(&properties),
+        let (properties, state) = match read {
+            Ok(read) => read,
             Err(e) => {
                 g_log!(glib::LogLevel::Debug, "Cannot read {}: {e}", path.as_str());
-                abort.abort();
                 if let Some(id) = shown.id {
                     close(&self.notifications, id).await;
                 }
@@ -400,7 +358,6 @@ impl Watcher<'_> {
             path.clone(),
             Followed {
                 properties,
-                changes: abort,
                 state,
                 shown,
             },
@@ -531,7 +488,6 @@ impl Watcher<'_> {
     /// was announced for it is kept.
     async fn remove(&mut self, path: &OwnedObjectPath) {
         if let Some(followed) = self.followed.remove(path) {
-            followed.changes.abort();
             if let Some(id) = followed.shown.id {
                 close(&self.notifications, id).await;
             }
@@ -571,10 +527,10 @@ impl Watcher<'_> {
         }
     }
 
-    async fn handle(&mut self, event: Event, events: &mut Events) {
+    async fn handle(&mut self, event: Event) {
         match event {
-            Event::Started => self.enumerate(events).await,
-            Event::Added(path) => self.follow(path, events).await,
+            Event::Started => self.enumerate().await,
+            Event::Added(path) => self.follow(path).await,
             Event::Removed(path) => self.remove(&path).await,
             Event::Changed(path, changes) => self.changed(&path, changes).await,
             Event::Service(event) => self.service(event).await,
@@ -598,8 +554,46 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
     let mut events: Events = SelectAll::new();
     let (owner, service) = service_events(session).await?;
     events.push(Box::pin(service.map(Event::Service)));
-    // In the order UPower sent them: a device removed and added again
-    // right away stays followed.
+    // UPower's comings and goings and every device's property changes, as
+    // one stream in the order UPower sent them: each level a device reports
+    // is acted on before the device's removal, and a device removed and
+    // added again right away stays followed. One subscription for all
+    // devices: no change is dropped when a device goes away.
+    let rule = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender(UPOWER)?
+        .interface("org.freedesktop.DBus.Properties")?
+        .member("PropertiesChanged")?
+        .add_arg(DEVICE_INTERFACE)?
+        .build();
+    let changed = OrderedStreamExt::filter_map(
+        MessageStream::for_match_rule(rule, system, Some(MAX_QUEUED_CHANGES)).await?,
+        |message| {
+            let path = OwnedObjectPath::from(message.as_ref().ok()?.path()?);
+            let signal = PropertiesChanged::from_message(message.ok()?)?;
+            let args = signal.args().ok()?;
+            if args.interface_name().as_str() != DEVICE_INTERFACE {
+                return None;
+            }
+            let changed = args
+                .changed_properties()
+                .iter()
+                .map(|(name, value)| (name.to_string(), OwnedValue::from(value)))
+                .collect();
+            let invalidated = args
+                .invalidated_properties()
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+            Some(Event::Changed(
+                path,
+                Changes {
+                    changed,
+                    invalidated,
+                },
+            ))
+        },
+    );
     let started = OrderedStreamExt::filter_map(
         dbus.receive_name_owner_changed_with_args(&[(0, UPOWER)])
             .await?,
@@ -617,7 +611,11 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
         ))
     });
     events.push(Box::pin(
-        ordered_stream::join(started, ordered_stream::join(added, removed)).into_stream(),
+        ordered_stream::join(
+            ordered_stream::join(started, changed),
+            ordered_stream::join(added, removed),
+        )
+        .into_stream(),
     ));
     events.push(Box::pin(stream::once(async { Event::Started })));
 
@@ -630,7 +628,7 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
         warnings: Warnings::default(),
     };
     while let Some(event) = events.next().await {
-        watcher.handle(event, &mut events).await;
+        watcher.handle(event).await;
     }
     Ok(())
 }
@@ -1297,5 +1295,58 @@ mod tests {
             log,
             &[&format!("notify 1 replaces 1 {}", mouse_critical(3))],
         );
+    }
+
+    /// A burst of levels, then the device's removal (and its return), all
+    /// reported while the notification server is still busy with another
+    /// device's warning: every level is acted on, before the removal.
+    fn burst_before_removal(add_again: bool) {
+        let world = World::new(
+            &[
+                (MOUSE, mouse(3, 9.0)),
+                (
+                    KEYBOARD,
+                    State {
+                        kind: 6,
+                        warning_level: 1,
+                        percentage: 50.0,
+                        battery_level: 1,
+                        serial: "K1".into(),
+                    },
+                ),
+            ],
+            true,
+        );
+        let log = &mut Vec::new();
+        world.expect(log, &[&format!("notify 1 replaces 0 {MOUSE_LOW} (9%)")]);
+        world.delay_ms.store(500, Ordering::SeqCst);
+        world.set_level(KEYBOARD, 3, 8.0);
+        world.set_level(MOUSE, 1, 9.0);
+        world.set_level(MOUSE, 3, 9.0);
+        world.remove(MOUSE);
+        if add_again {
+            world.add(MOUSE, mouse(3, 9.0));
+        }
+        world.expect(
+            log,
+            &[
+                "notify 2 replaces 0 Keyboard battery low: Wireless keyboard is low on power (8%)",
+                "close 1",
+                &format!("notify 3 replaces 0 {MOUSE_LOW} (9%)"),
+                "close 3",
+            ],
+        );
+    }
+
+    #[test]
+    fn levels_reported_before_a_removal_count() {
+        burst_before_removal(false);
+    }
+
+    /// Back at the level it was last announced at: nothing to say, and no
+    /// warning left up.
+    #[test]
+    fn levels_reported_before_a_removal_count_when_the_device_returns() {
+        burst_before_removal(true);
     }
 }
