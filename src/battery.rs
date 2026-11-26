@@ -13,10 +13,12 @@
 //! The batteries of wireless devices are followed in [`crate::devices`].
 
 use glib::g_log;
-use std::collections::HashMap;
-use std::pin::Pin;
-use zbus::export::futures_util::stream::{self, Stream};
-use zbus::export::futures_util::StreamExt;
+use std::collections::{HashMap, VecDeque};
+use std::future::{poll_fn, Future};
+use std::pin::{pin, Pin};
+use std::task::{Context, Poll};
+use zbus::export::futures_util::stream::{Fuse, Stream};
+use zbus::export::futures_util::{FutureExt, StreamExt};
 use zbus::export::ordered_stream::{self, OrderedStreamExt};
 use zbus::fdo::{DBusProxy, PropertiesProxy};
 use zbus::names::{InterfaceName, OwnedUniqueName, WellKnownName};
@@ -188,6 +190,147 @@ pub(crate) async fn service_events(
         owner,
         Box::pin(ordered_stream::join(owners, closed).into_stream()),
     ))
+}
+
+/// What became of a notification the service was asked to show.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Outcome {
+    /// It is up, under this id.
+    Up(Issued),
+    /// The instance that took it closed it by itself before its answer came
+    /// in: the id is dead already.
+    Closed,
+    /// The instance that took it no longer has the service: the id is dead,
+    /// and the notification is to be shown again on the next instance.
+    Lost,
+}
+
+/// The notification service, as a source of warnings talks to it.
+///
+/// While a call is outstanding the service's events keep coming in: an
+/// answer that takes long never holds up the news that an id died. The
+/// source applies those events ([`Notifier::ready`]) before its next step,
+/// an answer is checked against them, and an id is only replaced or closed
+/// while it is still live.
+pub(crate) struct Notifier<'a> {
+    session: &'a Connection,
+    events: Fuse<Pin<Box<dyn Stream<Item = ServiceEvent>>>>,
+    /// Events that came in and that the source has not applied yet.
+    taken: VecDeque<ServiceEvent>,
+    /// Who owns the service, as of the latest event that came in.
+    owner: Option<OwnedUniqueName>,
+}
+
+impl<'a> Notifier<'a> {
+    /// Subscribe to the notification service's events.
+    pub(crate) async fn new(session: &'a Connection) -> zbus::Result<Notifier<'a>> {
+        let (owner, events) = service_events(session).await?;
+        Ok(Notifier {
+            session,
+            events: events.fuse(),
+            taken: VecDeque::new(),
+            owner,
+        })
+    }
+
+    fn take(&mut self, event: ServiceEvent) {
+        if let ServiceEvent::Owner { owner, .. } = &event {
+            self.owner = owner.clone();
+        }
+        self.taken.push_back(event);
+    }
+
+    /// Take in the events that have arrived.
+    fn take_arrived(&mut self) {
+        while let Some(Some(event)) = self.events.next().now_or_never() {
+            self.take(event);
+        }
+    }
+
+    /// The next event to apply, if one has arrived, in the order the bus
+    /// delivered them.
+    pub(crate) fn ready(&mut self) -> Option<ServiceEvent> {
+        self.take_arrived();
+        self.taken.pop_front()
+    }
+
+    /// Wait for the next event to apply. Never ends: when the service's
+    /// events end, there is no more news.
+    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<ServiceEvent> {
+        if let Some(event) = self.taken.pop_front() {
+            return Poll::Ready(event);
+        }
+        match self.events.poll_next_unpin(cx) {
+            Poll::Ready(Some(event)) => {
+                if let ServiceEvent::Owner { owner, .. } = &event {
+                    self.owner = owner.clone();
+                }
+                Poll::Ready(event)
+            }
+            _ => Poll::Pending,
+        }
+    }
+
+    /// Whether `issued` may still be replaced or closed: the instance that
+    /// issued it still has the service, and has not closed it, as far as
+    /// the news that has arrived goes.
+    pub(crate) fn is_live(&mut self, issued: &Issued) -> bool {
+        self.take_arrived();
+        self.owner.as_ref() == Some(&issued.owner)
+            && !self
+                .taken
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::Closed(closed) if closed == issued))
+    }
+
+    /// Wait for `call`, taking in the service's events meanwhile.
+    async fn during<T>(&mut self, call: impl Future<Output = T>) -> T {
+        let mut call = pin!(call);
+        let output = poll_fn(|cx| {
+            while let Poll::Ready(Some(event)) = self.events.poll_next_unpin(cx) {
+                self.take(event);
+            }
+            call.as_mut().poll(cx)
+        })
+        .await;
+        // The bus delivers in order: what came before the answer has
+        // arrived by now.
+        self.take_arrived();
+        output
+    }
+
+    /// Show `warning`, in place of `replaces` while that is live; a dead id
+    /// is never sent, the warning is shown afresh instead.
+    pub(crate) async fn notify(
+        &mut self,
+        warning: &Warning,
+        replaces: Option<&Issued>,
+    ) -> zbus::Result<Outcome> {
+        let replaces = replaces.filter(|issued| self.is_live(issued));
+        let session = self.session;
+        let issued = self.during(notify(session, warning, replaces)).await?;
+        Ok(if !self.is_live(&issued) {
+            let closed = self
+                .taken
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::Closed(closed) if *closed == issued));
+            if closed {
+                Outcome::Closed
+            } else {
+                Outcome::Lost
+            }
+        } else {
+            Outcome::Up(issued)
+        })
+    }
+
+    /// Close `issued`, unless it is dead already.
+    pub(crate) async fn close(&mut self, issued: &Issued) {
+        if self.is_live(issued) {
+            let session = self.session;
+            self.during(close(session, issued)).await;
+        }
+    }
 }
 
 /// UPower's `WarningLevel`, reduced to the levels that warn on battery.
@@ -445,14 +588,13 @@ impl Display {
     }
 }
 
-/// What the battery warnings follow.
+/// What the battery warnings follow on the system bus.
 enum Update {
     /// One `PropertiesChanged` signal of the display device: the values it
     /// carries and the names of the properties it invalidates.
     Changed(HashMap<String, OwnedValue>, Vec<String>),
     /// UPower (re)started.
     Started,
-    Service(ServiceEvent),
 }
 
 /// Which level is on screen, so each level is announced once.
@@ -463,21 +605,29 @@ struct Tracker {
     shown: Option<Issued>,
     /// The body of the discharging warning on screen, which follows the UPS.
     body: String,
+    /// Whether to act on the display device again: it changed, or a
+    /// notification service appeared.
+    due: bool,
 }
 
 impl Tracker {
-    async fn update(&mut self, display: &Display, upower: &UPowerProxy<'_>, session: &Connection) {
+    async fn update(
+        &mut self,
+        display: &Display,
+        upower: &UPowerProxy<'_>,
+        notifier: &mut Notifier<'_>,
+    ) {
         let level = display.level();
         if level == self.level {
             if let (Level::Discharging, Some(shown)) = (level, self.shown.clone()) {
-                self.follow_discharge(&shown, display, session).await;
+                self.follow_discharge(&shown, display, notifier).await;
             }
             return;
         }
         // Like gnome-settings-daemon: the previous warning goes away when
         // the level changes, and a new one replaces it.
         if let Some(shown) = self.shown.take() {
-            close(session, &shown).await;
+            notifier.close(&shown).await;
         }
         self.level = Level::None;
         let action = upower.get_critical_action().await.unwrap_or_default();
@@ -490,12 +640,18 @@ impl Tracker {
         ) else {
             return;
         };
-        match notify(session, &warning, None).await {
-            Ok(shown) => {
+        match notifier.notify(&warning, None).await {
+            Ok(Outcome::Up(shown)) => {
                 self.level = level;
                 self.shown = Some(shown);
                 self.body = warning.body;
             }
+            // Dismissed before the answer came: like a warning the server
+            // closed later, it stays down.
+            Ok(Outcome::Closed) => self.level = level,
+            // The instance that took it lost the service: shown again when
+            // the next one appears.
+            Ok(Outcome::Lost) => {}
             // Retried on the next battery update, and when a notification
             // service appears: at login it may start after this daemon.
             Err(e) => g_log!(glib::LogLevel::Warning, "Cannot show battery warning: {e}"),
@@ -504,7 +660,12 @@ impl Tracker {
 
     /// While a UPS discharges, its warning counts the remaining time down in
     /// place: a new text replaces the notification on screen.
-    async fn follow_discharge(&mut self, shown: &Issued, display: &Display, session: &Connection) {
+    async fn follow_discharge(
+        &mut self,
+        shown: &Issued,
+        display: &Display,
+        notifier: &mut Notifier<'_>,
+    ) {
         let Some(warning) = warning(
             Level::Discharging,
             display.kind,
@@ -514,13 +675,20 @@ impl Tracker {
         ) else {
             return;
         };
-        if warning.body == self.body {
+        // An id that just died is dropped once its news is applied, and the
+        // warning then stays down or is shown again on the next service.
+        if warning.body == self.body || !notifier.is_live(shown) {
             return;
         }
-        match notify(session, &warning, Some(shown)).await {
-            Ok(shown) => {
+        match notifier.notify(&warning, Some(shown)).await {
+            Ok(Outcome::Up(shown)) => {
                 self.shown = Some(shown);
                 self.body = warning.body;
+            }
+            Ok(Outcome::Closed) => self.shown = None,
+            Ok(Outcome::Lost) => {
+                self.shown = None;
+                self.level = Level::None;
             }
             // Retried on the next update.
             Err(e) => g_log!(
@@ -530,22 +698,37 @@ impl Tracker {
         }
     }
 
-    /// `gone` lost the notification service: its id means nothing to the
-    /// next instance. A warning it had up is shown again once a service is
-    /// there. (A critical warning never expires, so the user would
-    /// otherwise lose it.)
-    fn service_gone(&mut self, gone: &OwnedUniqueName) {
-        if self.shown.as_ref().is_some_and(|shown| shown.is_from(gone)) {
-            self.shown = None;
-            self.level = Level::None;
-        }
-    }
-
-    /// The server closed a notification by itself (it expired, or the user
-    /// dismissed it): never close or replace that id.
-    fn closed(&mut self, closed: &Issued) {
-        if self.shown.as_ref() == Some(closed) {
-            self.shown = None;
+    /// Apply what the notification service tells.
+    fn service(&mut self, event: ServiceEvent) {
+        match event {
+            // The server closed a notification by itself (it expired, or the
+            // user dismissed it): never close or replace that id.
+            ServiceEvent::Closed(closed) => {
+                if self.shown.as_ref() == Some(&closed) {
+                    self.shown = None;
+                }
+            }
+            ServiceEvent::Owner { gone, owner } => {
+                // The ids of the instance that lost the service mean nothing
+                // to the next one. A warning it had up is shown again once a
+                // service is there. (A critical warning never expires, so the
+                // user would otherwise lose it.)
+                if let Some(gone) = gone {
+                    if self
+                        .shown
+                        .as_ref()
+                        .is_some_and(|shown| shown.is_from(&gone))
+                    {
+                        self.shown = None;
+                        self.level = Level::None;
+                    }
+                }
+                // A warning that could not be shown, or was lost with the
+                // old service, goes out now.
+                if owner.is_some() {
+                    self.due = true;
+                }
+            }
         }
     }
 }
@@ -563,6 +746,7 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
         level: Level::None,
         shown: None,
         body: String::new(),
+        due: true,
     };
 
     // Subscribe before reading, so that no change slips through. Each
@@ -597,45 +781,42 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
             started.then_some(Update::Started)
         },
     );
-    let (mut owner, service) = service_events(session).await?;
-    let mut updates = stream::select(
-        ordered_stream::join(changes, started).into_stream(),
-        service.map(Update::Service),
-    );
+    let mut notifier = Notifier::new(session).await?;
+    let mut updates = ordered_stream::join(changes, started).into_stream();
     let mut display = Display::read(&device).await?;
     loop {
-        tracker.update(&display, &upower, session).await;
-        loop {
-            match updates.next().await {
-                None => return Ok(()),
-                Some(Update::Changed(changed, invalidated)) => {
-                    display.apply(&changed, &invalidated, &device).await;
-                    break;
-                }
-                // A new UPower may report other values than its predecessor.
-                Some(Update::Started) => match Display::read(&device).await {
-                    Ok(read) => {
-                        display = read;
-                        break;
-                    }
-                    Err(e) => g_log!(glib::LogLevel::Debug, "Cannot read the display device: {e}"),
-                },
-                Some(Update::Service(ServiceEvent::Closed(closed))) => tracker.closed(&closed),
-                Some(Update::Service(ServiceEvent::Owner { gone, owner: new })) => {
-                    if let Some(gone) = gone {
-                        tracker.service_gone(&gone);
-                    }
-                    if new == owner {
-                        continue;
-                    }
-                    owner = new;
-                    // A warning that could not be shown, or was lost with
-                    // the old service, goes out now.
-                    if owner.is_some() {
-                        break;
-                    }
-                }
+        // The notification service's news first: which ids died, and
+        // whether a service appeared.
+        while let Some(event) = notifier.ready() {
+            tracker.service(event);
+        }
+        if tracker.due {
+            tracker.due = false;
+            tracker.update(&display, &upower, &mut notifier).await;
+            continue;
+        }
+        let next = poll_fn(|cx| {
+            if let Poll::Ready(event) = notifier.poll_next(cx) {
+                return Poll::Ready(Err(event));
             }
+            updates.poll_next_unpin(cx).map(Ok)
+        })
+        .await;
+        match next {
+            Err(event) => tracker.service(event),
+            Ok(None) => return Ok(()),
+            Ok(Some(Update::Changed(changed, invalidated))) => {
+                display.apply(&changed, &invalidated, &device).await;
+                tracker.due = true;
+            }
+            // A new UPower may report other values than its predecessor.
+            Ok(Some(Update::Started)) => match Display::read(&device).await {
+                Ok(read) => {
+                    display = read;
+                    tracker.due = true;
+                }
+                Err(e) => g_log!(glib::LogLevel::Debug, "Cannot read the display device: {e}"),
+            },
         }
     }
 }
@@ -1542,5 +1723,41 @@ pub(crate) mod tests {
         for (instance, calls) in world.calls.iter().enumerate() {
             assert_own_ids(instance, calls);
         }
+    }
+
+    /// The server closes the UPS warning while the daemon waits for its
+    /// answer to an update, and the UPS gets worse meanwhile: the closed id
+    /// is never replaced or closed again, even though the late answer
+    /// carries it.
+    #[test]
+    fn an_id_closed_during_a_call_stays_dead() {
+        let world = World::new(FakeDevice {
+            kind: KIND_UPS,
+            warning_level: 2,
+            percentage: 80.0,
+            time_to_empty: 600,
+        });
+        let log = &mut Vec::new();
+        world.expect(
+            log,
+            &["notify 1 UPS Discharging: 10 minutes of UPS backup power remaining (80%) (urgency 1)"],
+        );
+        let gate = world.gate.clone();
+        let held = zbus::block_on(gate.lock());
+        world.burst(&[&[("Percentage", Value::F64(70.0))]]);
+        world.expect(
+            log,
+            &["notify 1 (replaces 1) UPS Discharging: 10 minutes of UPS backup power remaining (70%) (urgency 1)"],
+        );
+        world.expire(1);
+        world.burst(&[&[("WarningLevel", Value::U32(4))]]);
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+        world.expect(
+            log,
+            &["notify 2 UPS Almost Empty: 70% UPS power remaining (urgency 2)"],
+        );
+        world.burst(&[&[("WarningLevel", Value::U32(1))]]);
+        world.expect(log, &["close 2"]);
     }
 }

@@ -15,20 +15,24 @@
 //! level is on record as announced only once the notification server took
 //! the warning. The notification service may start late or restart; the
 //! warnings up when it went away are shown again on its successor. An id is
-//! only ever replaced or closed through the instance that issued it.
+//! only ever replaced or closed through the instance that issued it, and
+//! never once it died: the service's news is taken in even while the daemon
+//! waits for an answer.
 
 use glib::g_log;
 use std::collections::HashMap;
-use std::pin::Pin;
-use zbus::export::futures_util::stream::{self, SelectAll, Stream};
+use std::future::poll_fn;
+use std::pin::pin;
+use std::task::Poll;
+use zbus::export::futures_util::stream::{self, Stream};
 use zbus::export::futures_util::StreamExt;
 use zbus::export::ordered_stream::{self, OrderedStreamExt};
 use zbus::fdo::{DBusProxy, PropertiesChanged, PropertiesProxy};
-use zbus::names::{InterfaceName, OwnedUniqueName};
+use zbus::names::InterfaceName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream, MessageType};
 
-use crate::battery::{close, notify, service_events, Issued, ServiceEvent, UPowerProxy, Warning};
+use crate::battery::{Issued, Notifier, Outcome, ServiceEvent, UPowerProxy, Warning};
 
 const UPOWER: &str = "org.freedesktop.UPower";
 const DEVICE_INTERFACE: &str = "org.freedesktop.UPower.Device";
@@ -224,10 +228,7 @@ enum Event {
     Added(OwnedObjectPath),
     Removed(OwnedObjectPath),
     Changed(OwnedObjectPath, Changes),
-    Service(ServiceEvent),
 }
-
-type Events = SelectAll<Pin<Box<dyn Stream<Item = Event>>>>;
 
 /// A device's warning, from the notification service's side.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -297,12 +298,13 @@ impl Warnings {
 
 struct Watcher<'a> {
     system: &'a Connection,
-    session: &'a Connection,
     upower: UPowerProxy<'static>,
-    /// The notification service's current owner, if any.
-    owner: Option<OwnedUniqueName>,
+    notifier: Notifier<'a>,
     followed: HashMap<OwnedObjectPath, Followed>,
     warnings: Warnings,
+    /// Whether a notification service appeared, to show again there what
+    /// was up on its predecessor, or could not be shown.
+    reshow: bool,
 }
 
 impl Watcher<'_> {
@@ -334,11 +336,6 @@ impl Watcher<'_> {
     /// changes come in through the subscription [`watch`] holds for every
     /// device, so none is missed.
     async fn follow(&mut self, path: OwnedObjectPath) {
-        let shown = self
-            .followed
-            .remove(&path)
-            .map(|old| old.shown)
-            .unwrap_or_default();
         let read = async {
             let properties = PropertiesProxy::builder(self.system)
                 .destination(UPOWER)?
@@ -356,12 +353,15 @@ impl Watcher<'_> {
             Ok(read) => read,
             Err(e) => {
                 g_log!(glib::LogLevel::Debug, "Cannot read {}: {e}", path.as_str());
-                if let Some(id) = &shown.id {
-                    close(self.session, id).await;
-                }
+                self.remove(&path).await;
                 return;
             }
         };
+        let shown = self
+            .followed
+            .remove(&path)
+            .map(|old| old.shown)
+            .unwrap_or_default();
         self.followed.insert(
             path.clone(),
             Followed {
@@ -408,6 +408,7 @@ impl Watcher<'_> {
     /// Act on a followed device's current state: warn, or withdraw its
     /// warning, as needed.
     async fn evaluate(&mut self, path: &OwnedObjectPath) {
+        self.settle();
         let Some(followed) = self.followed.get_mut(path) else {
             return;
         };
@@ -433,7 +434,7 @@ impl Watcher<'_> {
                 }
                 let shown = std::mem::take(&mut followed.shown);
                 if let Some(id) = &shown.id {
-                    close(self.session, id).await;
+                    self.notifier.close(id).await;
                 }
             }
             Action::Settle => followed.shown.pending = None,
@@ -446,7 +447,8 @@ impl Watcher<'_> {
     /// escalation, or the warning that was up when the notification service
     /// was replaced.
     async fn show(&mut self, path: &OwnedObjectPath) {
-        let Some(followed) = self.followed.get_mut(path) else {
+        self.settle();
+        let Some(followed) = self.followed.get(path) else {
             return;
         };
         let shown = followed.shown.clone();
@@ -457,16 +459,28 @@ impl Watcher<'_> {
         };
         let state = &followed.state;
         let warning = warning(severity, state.kind, state.percentage, state.battery_level);
+        let identity = Identity::of(&state.serial, path);
         // A critical warning takes the place of the low one.
-        match notify(self.session, &warning, shown.id.as_ref()).await {
-            Ok(id) => {
+        let outcome = self.notifier.notify(&warning, shown.id.as_ref()).await;
+        let Some(followed) = self.followed.get_mut(path) else {
+            return;
+        };
+        match outcome {
+            Ok(outcome) => {
                 followed.shown = Shown {
                     severity: Some(severity),
-                    id: Some(id),
+                    id: None,
                     pending: None,
                 };
+                match outcome {
+                    Outcome::Up(id) => followed.shown.id = Some(id),
+                    // Dismissed before the answer came: dead, as if the
+                    // server had closed it later.
+                    Outcome::Closed => followed.shown.severity = None,
+                    // Shown again on the next instance of the service.
+                    Outcome::Lost => {}
+                }
                 if shown.pending.is_some() {
-                    let identity = Identity::of(&state.serial, path);
                     self.warnings.accepted(identity, severity);
                 }
             }
@@ -482,14 +496,24 @@ impl Watcher<'_> {
     /// Stop following a device that went away and withdraw its warning. What
     /// was announced for it is kept.
     async fn remove(&mut self, path: &OwnedObjectPath) {
+        self.settle();
         if let Some(followed) = self.followed.remove(path) {
             if let Some(id) = &followed.shown.id {
-                close(self.session, id).await;
+                self.notifier.close(id).await;
             }
         }
     }
 
-    async fn service(&mut self, event: ServiceEvent) {
+    /// Apply the notification service's news that has arrived. Done before
+    /// each step, so a step never acts on an id that died meanwhile, even
+    /// while the daemon waited for an answer.
+    fn settle(&mut self) {
+        while let Some(event) = self.notifier.ready() {
+            self.service(event);
+        }
+    }
+
+    fn service(&mut self, event: ServiceEvent) {
         match event {
             ServiceEvent::Closed(closed) => {
                 // Dead from now on: never replaced, never closed.
@@ -504,8 +528,7 @@ impl Watcher<'_> {
                 if let Some(gone) = gone {
                     // The ids of the instance that lost the service mean
                     // nothing to the next one; what it had up is shown
-                    // again there. An id the next one issued (it may have
-                    // answered before this news came) stays.
+                    // again there.
                     for followed in self.followed.values_mut() {
                         let shown = &mut followed.shown;
                         if shown.id.as_ref().is_some_and(|id| id.is_from(&gone)) {
@@ -513,15 +536,8 @@ impl Watcher<'_> {
                         }
                     }
                 }
-                if owner == self.owner {
-                    return;
-                }
-                self.owner = owner;
-                if self.owner.is_some() {
-                    let paths: Vec<_> = self.followed.keys().cloned().collect();
-                    for path in paths {
-                        self.show(&path).await;
-                    }
+                if owner.is_some() {
+                    self.reshow = true;
                 }
             }
         }
@@ -533,9 +549,16 @@ impl Watcher<'_> {
             Event::Added(path) => self.follow(path).await,
             Event::Removed(path) => self.remove(&path).await,
             Event::Changed(path, changes) => self.changed(&path, changes).await,
-            Event::Service(event) => self.service(event).await,
         }
     }
+}
+
+/// What the device warnings wait for.
+enum Next {
+    Service(ServiceEvent),
+    UPower(Event),
+    /// Nothing from UPower is waiting: show again what is to be shown again.
+    Reshow,
 }
 
 /// Follow UPower's devices and notify until a connection fails.
@@ -544,9 +567,7 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
     let dbus = DBusProxy::new(system).await?;
 
     // Subscribe before enumerating, so that no device slips through.
-    let mut events: Events = SelectAll::new();
-    let (owner, service) = service_events(session).await?;
-    events.push(Box::pin(service.map(Event::Service)));
+    let notifier = Notifier::new(session).await?;
     // UPower's comings and goings and every device's property changes, as
     // one stream in the order UPower sent them: each level a device reports
     // is acted on before the device's removal, and a device removed and
@@ -603,27 +624,51 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
             signal.args().ok()?.device().to_owned().into(),
         ))
     });
-    events.push(Box::pin(
+    let events = stream::once(async { Event::Started }).chain(
         ordered_stream::join(
             ordered_stream::join(started, changed),
             ordered_stream::join(added, removed),
         )
         .into_stream(),
-    ));
-    events.push(Box::pin(stream::once(async { Event::Started })));
+    );
+    let mut events = pin!(events);
 
     let mut watcher = Watcher {
         system,
-        session,
         upower,
-        owner,
+        notifier,
         followed: HashMap::new(),
         warnings: Warnings::default(),
+        reshow: false,
     };
-    while let Some(event) = events.next().await {
-        watcher.handle(event).await;
+    loop {
+        watcher.settle();
+        let reshow = watcher.reshow;
+        let next = poll_fn(|cx| {
+            // The notification service's news first: which ids died.
+            if let Poll::Ready(event) = watcher.notifier.poll_next(cx) {
+                return Poll::Ready(Some(Next::Service(event)));
+            }
+            match events.as_mut().poll_next(cx) {
+                Poll::Ready(event) => Poll::Ready(event.map(Next::UPower)),
+                Poll::Pending if reshow => Poll::Ready(Some(Next::Reshow)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+        match next {
+            None => return Ok(()),
+            Some(Next::Service(event)) => watcher.service(event),
+            Some(Next::UPower(event)) => watcher.handle(event).await,
+            Some(Next::Reshow) => {
+                watcher.reshow = false;
+                let paths: Vec<_> = watcher.followed.keys().cloned().collect();
+                for path in paths {
+                    watcher.show(&path).await;
+                }
+            }
+        }
     }
-    Ok(())
 }
 
 /// Run the device warnings for the lifetime of the daemon.
@@ -1452,5 +1497,47 @@ mod tests {
         for (instance, calls) in world.calls.iter().enumerate() {
             assert_own_ids(instance, calls);
         }
+    }
+
+    /// While the daemon waits for the answer to the keyboard's warning, the
+    /// server closes the mouse's warning and the keyboard's own (before its
+    /// answer came), and both devices get worse: neither closed id is
+    /// replaced or closed again, the critical warnings are new ones.
+    #[test]
+    fn ids_closed_during_a_call_stay_dead() {
+        let keyboard = State {
+            kind: 6,
+            warning_level: 1,
+            percentage: 10.0,
+            battery_level: 1,
+            serial: "K1".into(),
+        };
+        let world = World::new(&[(MOUSE, mouse(3, 9.0)), (KEYBOARD, keyboard)], true);
+        let keyboard_low = "Keyboard battery low: Wireless keyboard is low on power (10%)";
+        let log = &mut Vec::new();
+        world.expect(log, &[&format!("notify 1 replaces 0 {MOUSE_LOW} (9%)")]);
+        let gate = world.gate.clone();
+        let held = zbus::block_on(gate.lock());
+        world.set_level(KEYBOARD, 3, 10.0);
+        world.expect(log, &[&format!("notify 2 replaces 0 {keyboard_low}")]);
+        world.expire(1);
+        world.expire(2);
+        world.set_level(MOUSE, 4, 4.0);
+        world.set_level(KEYBOARD, 4, 4.0);
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+        world.expect(
+            log,
+            &[
+                &format!("notify 3 replaces 0 {}", mouse_critical(4)),
+                &format!(
+                    "notify 4 replaces 0 Keyboard battery low: Wireless keyboard is very low on power (4%). {STOP}"
+                ),
+            ],
+        );
+        // Fine again: only the new warnings are closed.
+        world.set_level(MOUSE, 1, 50.0);
+        world.set_level(KEYBOARD, 1, 50.0);
+        world.expect(log, &["close 3", "close 4"]);
     }
 }
