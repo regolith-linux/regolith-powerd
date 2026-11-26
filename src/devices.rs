@@ -242,7 +242,8 @@ struct Shown {
     /// while it still has to be shown again on a new instance.
     id: Option<Issued>,
     /// An escalation above what was announced that has not been accepted
-    /// yet: there was no service, or `Notify` failed.
+    /// yet: there was no service, `Notify` failed, or its answer came only
+    /// after the instance it went to lost the service.
     pending: Option<Severity>,
 }
 
@@ -601,31 +602,46 @@ impl Watcher<'_> {
         let Some(followed) = self.followed.get_mut(&showing.path) else {
             return;
         };
-        match answer {
-            Ok(outcome) => {
-                followed.shown = Shown {
-                    severity: Some(showing.severity),
+        followed.shown = match answer {
+            Ok(Outcome::Up(id)) => Shown {
+                severity: Some(showing.severity),
+                id: Some(id),
+                pending: None,
+            },
+            // Dismissed before the answer came: dead, as if the server had
+            // closed it later.
+            Ok(Outcome::Closed) => Shown::default(),
+            // The instance that took it lost the service before it answered:
+            // not shown, and so not announced either.
+            Ok(Outcome::Lost) if showing.rise => {
+                // The escalation took the place of the warning it was to
+                // replace, which went with that instance. It is still owed
+                // to the next one; nothing else is up meanwhile.
+                Shown {
+                    severity: None,
                     id: None,
-                    pending: None,
-                };
-                match outcome {
-                    Outcome::Up(id) => followed.shown.id = Some(id),
-                    // Dismissed before the answer came: dead, as if the
-                    // server had closed it later.
-                    Outcome::Closed => followed.shown.severity = None,
-                    // Shown again on the next instance of the service.
-                    Outcome::Lost => {}
-                }
-                if showing.rise {
-                    self.warnings.accepted(showing.identity, showing.severity);
+                    pending: Some(showing.severity),
                 }
             }
+            // Shown again on the next instance of the service.
+            Ok(Outcome::Lost) => Shown {
+                severity: Some(showing.severity),
+                id: None,
+                pending: None,
+            },
             // Not announced: what was announced before still stands, and
             // the next change, or a new notification service, tries again.
-            Err(e) => g_log!(
-                glib::LogLevel::Warning,
-                "Cannot show device battery warning: {e}"
-            ),
+            Err(e) => {
+                g_log!(
+                    glib::LogLevel::Warning,
+                    "Cannot show device battery warning: {e}"
+                );
+                return;
+            }
+        };
+        // Accepted (even if dismissed since), unless it is still owed.
+        if showing.rise && followed.shown.pending.is_none() {
+            self.warnings.accepted(showing.identity, showing.severity);
         }
     }
 
@@ -1721,5 +1737,37 @@ mod tests {
         world.expect(log, &["close 2"]);
         world.set_level(MOUSE, 1, 50.0);
         world.expect(log, &["close 3"]);
+    }
+
+    /// The critical warning is answered only after its instance lost the
+    /// service, and the next instance refuses it: it was never announced,
+    /// so the device is still on record as low. Low again says nothing new;
+    /// the next rise escalates.
+    #[test]
+    fn a_critical_answered_too_late_is_not_announced() {
+        let mut world = World::new(&[(MOUSE, mouse(3, 9.0))], true);
+        let log = &mut Vec::new();
+        world.expect(log, &[&format!("notify 1 replaces 0 {MOUSE_LOW} (9%)")]);
+        let gate = world.gate.clone();
+        let held = zbus::block_on(gate.lock());
+        world.set_level(MOUSE, 4, 4.0);
+        world.expect(
+            log,
+            &[&format!("notify 1 replaces 1 {}", mouse_critical(4))],
+        );
+        world.refuse.store(true, Ordering::SeqCst);
+        world.hand_over();
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+        world.expect(log, &["refused Mouse battery low"]);
+        world.refuse.store(false, Ordering::SeqCst);
+        world.set_level(MOUSE, 3, 5.0);
+        world.expect(log, &[]);
+        world.set_level(MOUSE, 4, 4.0);
+        world.expect(
+            log,
+            &[&format!("notify 1 replaces 0 {}", mouse_critical(4))],
+        );
+        assert_eq!(world.calls[1].lock().unwrap().len(), 1);
     }
 }
