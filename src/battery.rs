@@ -19,14 +19,15 @@ use zbus::export::futures_util::stream::{self, Stream};
 use zbus::export::futures_util::StreamExt;
 use zbus::export::ordered_stream::{self, OrderedStreamExt};
 use zbus::fdo::{DBusProxy, PropertiesProxy};
-use zbus::names::{InterfaceName, WellKnownName};
+use zbus::names::{InterfaceName, OwnedUniqueName, WellKnownName};
 use zbus::zvariant::{OwnedValue, Value};
 use zbus::{dbus_proxy, Connection};
 
-pub(crate) const APP_NAME: &str = "Power";
+const APP_NAME: &str = "Power";
 const LOW_TIMEOUT_MS: i32 = 30_000;
 const RETRY_SECS: u32 = 60;
 const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
+const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 const UPOWER: &str = "org.freedesktop.UPower";
 const DEVICE_INTERFACE: &str = "org.freedesktop.UPower.Device";
 const DISPLAY_DEVICE: &str = "/org/freedesktop/UPower/devices/DisplayDevice";
@@ -53,32 +54,95 @@ pub(crate) trait UPower {
     default_service = "org.freedesktop.Notifications",
     default_path = "/org/freedesktop/Notifications"
 )]
-pub(crate) trait Notifications {
-    #[allow(clippy::too_many_arguments)]
-    fn notify(
-        &self,
-        app_name: &str,
-        replaces_id: u32,
-        app_icon: &str,
-        summary: &str,
-        body: &str,
-        actions: &[&str],
-        hints: HashMap<&str, Value<'_>>,
-        expire_timeout: i32,
-    ) -> zbus::Result<u32>;
-    fn close_notification(&self, id: u32) -> zbus::Result<()>;
+trait Notifications {
     #[dbus_proxy(signal)]
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
+}
+
+/// A notification's id, with the instance of the notification service that
+/// issued it: its unique bus name. The id means nothing to any other
+/// instance, so the notification is replaced and closed through its issuer
+/// only, even while the service changes hands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Issued {
+    owner: OwnedUniqueName,
+    id: u32,
+}
+
+impl Issued {
+    pub(crate) fn is_from(&self, owner: &OwnedUniqueName) -> bool {
+        &self.owner == owner
+    }
+}
+
+/// Show `warning`, in place of `replaces` if given. A new notification goes
+/// to whoever owns the service (which may start it on demand), a
+/// replacement to the instance that issued the id.
+pub(crate) async fn notify(
+    session: &Connection,
+    warning: &Warning,
+    replaces: Option<&Issued>,
+) -> zbus::Result<Issued> {
+    let destination = replaces.map_or(NOTIFICATIONS, |issued| issued.owner.as_str());
+    let actions: &[&str] = &[];
+    let reply = session
+        .call_method(
+            Some(destination),
+            NOTIFICATIONS_PATH,
+            Some(NOTIFICATIONS),
+            "Notify",
+            &(
+                APP_NAME,
+                replaces.map_or(0, |issued| issued.id),
+                warning.icon,
+                &warning.summary,
+                &warning.body,
+                actions,
+                warning.hints(),
+                warning.timeout_ms,
+            ),
+        )
+        .await?;
+    let id = reply.body::<u32>()?;
+    // The instance that answered, whichever owned the name by then.
+    let owner = reply
+        .header()?
+        .sender()?
+        .ok_or_else(|| zbus::Error::Failure("Notify reply without a sender".into()))?
+        .to_owned()
+        .into();
+    Ok(Issued { owner, id })
+}
+
+/// Close a notification, through the instance that issued it.
+pub(crate) async fn close(session: &Connection, issued: &Issued) {
+    if let Err(e) = session
+        .call_method(
+            Some(issued.owner.as_str()),
+            NOTIFICATIONS_PATH,
+            Some(NOTIFICATIONS),
+            "CloseNotification",
+            &issued.id,
+        )
+        .await
+    {
+        g_log!(glib::LogLevel::Debug, "Cannot close notification: {e}");
+    }
 }
 
 /// What the notification service tells a source of warnings.
 #[derive(Debug)]
 pub(crate) enum ServiceEvent {
-    /// `org.freedesktop.Notifications` has a new owner, or (`None`) none.
-    Owner(Option<String>),
-    /// The current owner closed one of its notifications by itself: it
-    /// expired or the user dismissed it. The id is dead from now on.
-    Closed(u32),
+    /// `org.freedesktop.Notifications` changed hands: `gone` lost it, if it
+    /// had an owner, and `owner` has it now, if anyone. The ids `gone`
+    /// issued are dead from now on.
+    Owner {
+        gone: Option<OwnedUniqueName>,
+        owner: Option<OwnedUniqueName>,
+    },
+    /// An instance closed one of its notifications by itself: it expired or
+    /// the user dismissed it. The id is dead from now on.
+    Closed(Issued),
 }
 
 /// Who owns the notification service right now, and the changes to come,
@@ -86,31 +150,40 @@ pub(crate) enum ServiceEvent {
 /// change slips through.
 pub(crate) async fn service_events(
     session: &Connection,
-) -> zbus::Result<(Option<String>, Pin<Box<dyn Stream<Item = ServiceEvent>>>)> {
+) -> zbus::Result<(
+    Option<OwnedUniqueName>,
+    Pin<Box<dyn Stream<Item = ServiceEvent>>>,
+)> {
     let dbus = DBusProxy::new(session).await?;
     let owners = OrderedStreamExt::filter_map(
         dbus.receive_name_owner_changed_with_args(&[(0, NOTIFICATIONS)])
             .await?,
         |signal| {
             let args = signal.args().ok()?;
-            let owner = args.new_owner().as_ref().map(|owner| owner.to_string());
-            Some(ServiceEvent::Owner(owner))
+            Some(ServiceEvent::Owner {
+                gone: args.old_owner().as_ref().map(|gone| gone.to_owned().into()),
+                owner: args
+                    .new_owner()
+                    .as_ref()
+                    .map(|owner| owner.to_owned().into()),
+            })
         },
     );
-    // zbus follows the owner of the well-known name: only the current
-    // instance's signals come through.
     let closed = OrderedStreamExt::filter_map(
         NotificationsProxy::new(session)
             .await?
             .receive_notification_closed()
             .await?,
-        |signal| Some(ServiceEvent::Closed(signal.args().ok()?.id)),
+        |signal| {
+            let id = signal.args().ok()?.id;
+            let owner = signal.header().ok()?.sender().ok()??.to_owned().into();
+            Some(ServiceEvent::Closed(Issued { owner, id }))
+        },
     );
     let owner = dbus
         .get_name_owner(WellKnownName::from_static_str_unchecked(NOTIFICATIONS).into())
         .await
-        .ok()
-        .map(|owner| owner.to_string());
+        .ok();
     Ok((
         owner,
         Box::pin(ordered_stream::join(owners, closed).into_stream()),
@@ -385,33 +458,26 @@ enum Update {
 /// Which level is on screen, so each level is announced once.
 struct Tracker {
     level: Level,
-    /// The notification for `level`, while the current notification service
-    /// has it up.
-    shown: Option<u32>,
+    /// The notification for `level`, while the notification service has it
+    /// up.
+    shown: Option<Issued>,
     /// The body of the discharging warning on screen, which follows the UPS.
     body: String,
 }
 
 impl Tracker {
-    async fn update(
-        &mut self,
-        display: &Display,
-        upower: &UPowerProxy<'_>,
-        notifications: &NotificationsProxy<'_>,
-    ) {
+    async fn update(&mut self, display: &Display, upower: &UPowerProxy<'_>, session: &Connection) {
         let level = display.level();
         if level == self.level {
-            if let (Level::Discharging, Some(id)) = (level, self.shown) {
-                self.follow_discharge(id, display, notifications).await;
+            if let (Level::Discharging, Some(shown)) = (level, self.shown.clone()) {
+                self.follow_discharge(&shown, display, session).await;
             }
             return;
         }
         // Like gnome-settings-daemon: the previous warning goes away when
         // the level changes, and a new one replaces it.
-        if let Some(id) = self.shown.take() {
-            if let Err(e) = notifications.close_notification(id).await {
-                g_log!(glib::LogLevel::Debug, "Cannot close notification: {e}");
-            }
+        if let Some(shown) = self.shown.take() {
+            close(session, &shown).await;
         }
         self.level = Level::None;
         let action = upower.get_critical_action().await.unwrap_or_default();
@@ -424,22 +490,10 @@ impl Tracker {
         ) else {
             return;
         };
-        match notifications
-            .notify(
-                APP_NAME,
-                0,
-                warning.icon,
-                &warning.summary,
-                &warning.body,
-                &[],
-                warning.hints(),
-                warning.timeout_ms,
-            )
-            .await
-        {
-            Ok(id) => {
+        match notify(session, &warning, None).await {
+            Ok(shown) => {
                 self.level = level;
-                self.shown = Some(id);
+                self.shown = Some(shown);
                 self.body = warning.body;
             }
             // Retried on the next battery update, and when a notification
@@ -450,12 +504,7 @@ impl Tracker {
 
     /// While a UPS discharges, its warning counts the remaining time down in
     /// place: a new text replaces the notification on screen.
-    async fn follow_discharge(
-        &mut self,
-        id: u32,
-        display: &Display,
-        notifications: &NotificationsProxy<'_>,
-    ) {
+    async fn follow_discharge(&mut self, shown: &Issued, display: &Display, session: &Connection) {
         let Some(warning) = warning(
             Level::Discharging,
             display.kind,
@@ -468,21 +517,9 @@ impl Tracker {
         if warning.body == self.body {
             return;
         }
-        match notifications
-            .notify(
-                APP_NAME,
-                id,
-                warning.icon,
-                &warning.summary,
-                &warning.body,
-                &[],
-                warning.hints(),
-                warning.timeout_ms,
-            )
-            .await
-        {
-            Ok(id) => {
-                self.shown = Some(id);
+        match notify(session, &warning, Some(shown)).await {
+            Ok(shown) => {
+                self.shown = Some(shown);
                 self.body = warning.body;
             }
             // Retried on the next update.
@@ -493,20 +530,21 @@ impl Tracker {
         }
     }
 
-    /// The notification service went away or was replaced: the old
-    /// instance's id means nothing to the next one. A warning that was up
-    /// is shown again once a service is there. (A critical warning never
-    /// expires, so the user would otherwise lose it.)
-    fn service_changed(&mut self) {
-        if self.shown.take().is_some() {
+    /// `gone` lost the notification service: its id means nothing to the
+    /// next instance. A warning it had up is shown again once a service is
+    /// there. (A critical warning never expires, so the user would
+    /// otherwise lose it.)
+    fn service_gone(&mut self, gone: &OwnedUniqueName) {
+        if self.shown.as_ref().is_some_and(|shown| shown.is_from(gone)) {
+            self.shown = None;
             self.level = Level::None;
         }
     }
 
     /// The server closed a notification by itself (it expired, or the user
     /// dismissed it): never close or replace that id.
-    fn closed(&mut self, id: u32) {
-        if self.shown == Some(id) {
+    fn closed(&mut self, closed: &Issued) {
+        if self.shown.as_ref() == Some(closed) {
             self.shown = None;
         }
     }
@@ -515,7 +553,6 @@ impl Tracker {
 /// Watch the battery and notify until a connection fails.
 pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()> {
     let upower = UPowerProxy::new(system).await?;
-    let notifications = NotificationsProxy::new(session).await?;
     let device = PropertiesProxy::builder(system)
         .destination(UPOWER)?
         .path(DISPLAY_DEVICE)?
@@ -567,7 +604,7 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
     );
     let mut display = Display::read(&device).await?;
     loop {
-        tracker.update(&display, &upower, &notifications).await;
+        tracker.update(&display, &upower, session).await;
         loop {
             match updates.next().await {
                 None => return Ok(()),
@@ -583,13 +620,13 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
                     }
                     Err(e) => g_log!(glib::LogLevel::Debug, "Cannot read the display device: {e}"),
                 },
-                Some(Update::Service(ServiceEvent::Closed(id))) => tracker.closed(id),
-                Some(Update::Service(ServiceEvent::Owner(new))) => {
+                Some(Update::Service(ServiceEvent::Closed(closed))) => tracker.closed(&closed),
+                Some(Update::Service(ServiceEvent::Owner { gone, owner: new })) => {
+                    if let Some(gone) = gone {
+                        tracker.service_gone(&gone);
+                    }
                     if new == owner {
                         continue;
-                    }
-                    if owner.is_some() {
-                        tracker.service_changed();
                     }
                     owner = new;
                     // A warning that could not be shown, or was lost with
@@ -631,6 +668,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+    use zbus::export::futures_util::lock::Mutex as Gate;
     use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
 
     #[test]
@@ -770,16 +808,80 @@ pub(crate) mod tests {
         }
     }
 
-    /// A notification server that records what it is asked to do.
+    /// What one instance of a fake notification service was asked to do.
+    #[derive(Debug, Clone)]
+    pub(crate) enum Call {
+        Notify {
+            id: u32,
+            replaces: u32,
+            text: String,
+        },
+        Close(u32),
+    }
+
+    /// The calls one instance of a fake notification service took.
+    pub(crate) type Calls = Arc<Mutex<Vec<Call>>>;
+
+    /// Check that an instance of the notification service was only asked to
+    /// replace or close notifications it issued itself.
+    #[track_caller]
+    pub(crate) fn assert_own_ids(instance: usize, calls: &Calls) {
+        let mut issued = Vec::new();
+        for call in calls.lock().unwrap().iter() {
+            match call {
+                Call::Notify { id, replaces, .. } => {
+                    assert!(
+                        *replaces == 0 || issued.contains(replaces),
+                        "instance {instance} asked to replace an id of another: {call:?}"
+                    );
+                    issued.push(*id);
+                }
+                Call::Close(id) => assert!(
+                    issued.contains(id),
+                    "instance {instance} asked to close an id of another: {call:?}"
+                ),
+            }
+        }
+    }
+
+    /// The notifications an instance of the notification service has up,
+    /// once that settles (or after 5 s) at `expected`.
+    pub(crate) fn wait_up(calls: &Calls, expected: &[&str]) -> Vec<String> {
+        let up = || {
+            let mut up: Vec<(u32, String)> = Vec::new();
+            for call in calls.lock().unwrap().iter() {
+                match call {
+                    Call::Notify { id, replaces, text } => {
+                        up.retain(|(shown, _)| shown != id && shown != replaces);
+                        up.push((*id, text.clone()));
+                    }
+                    Call::Close(id) => up.retain(|(shown, _)| shown != id),
+                }
+            }
+            up.into_iter().map(|(_, text)| text).collect::<Vec<_>>()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while up() != expected && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Give unexpected extra calls a chance to show up.
+        std::thread::sleep(Duration::from_millis(300));
+        up()
+    }
+
+    /// A notification server that records what it is asked to do, and
+    /// holds back its answers to `Notify` while `gate` is locked.
     struct FakeNotifications {
         log: Arc<Mutex<Vec<String>>>,
+        calls: Calls,
+        gate: Arc<Gate<()>>,
         next_id: u32,
     }
 
     #[dbus_interface(name = "org.freedesktop.Notifications")]
     impl FakeNotifications {
         #[allow(clippy::too_many_arguments)]
-        fn notify(
+        async fn notify(
             &mut self,
             _app_name: &str,
             replaces_id: u32,
@@ -805,13 +907,22 @@ pub(crate) mod tests {
             } else {
                 format!(" (replaces {replaces_id})")
             };
-            self.log.lock().unwrap().push(format!(
-                "notify {id}{replaces} {summary}: {body} (urgency {urgency})"
-            ));
+            let text = format!("{summary}: {body} (urgency {urgency})");
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("notify {id}{replaces} {text}"));
+            self.calls.lock().unwrap().push(Call::Notify {
+                id,
+                replaces: replaces_id,
+                text,
+            });
+            let _open = self.gate.lock().await;
             id
         }
         fn close_notification(&mut self, id: u32) {
             self.log.lock().unwrap().push(format!("close {id}"));
+            self.calls.lock().unwrap().push(Call::Close(id));
         }
         #[dbus_interface(signal)]
         async fn notification_closed(
@@ -948,6 +1059,8 @@ pub(crate) mod tests {
                     "/org/freedesktop/Notifications",
                     FakeNotifications {
                         log: log.clone(),
+                        calls: Calls::default(),
+                        gate: Arc::default(),
                         next_id: 0,
                     },
                 )?
@@ -1025,6 +1138,8 @@ pub(crate) mod tests {
                     "/org/freedesktop/Notifications",
                     FakeNotifications {
                         log: log.clone(),
+                        calls: Calls::default(),
+                        gate: Arc::default(),
                         next_id: 0,
                     },
                 )?
@@ -1080,6 +1195,8 @@ pub(crate) mod tests {
                     "/org/freedesktop/Notifications",
                     FakeNotifications {
                         log: log.clone(),
+                        calls: Calls::default(),
+                        gate: Arc::default(),
                         next_id: 0,
                     },
                 )?
@@ -1118,6 +1235,8 @@ pub(crate) mod tests {
                     "/org/freedesktop/Notifications",
                     FakeNotifications {
                         log: log.clone(),
+                        calls: Calls::default(),
+                        gate: Arc::default(),
                         next_id: 0,
                     },
                 )?
@@ -1181,7 +1300,12 @@ pub(crate) mod tests {
         address: String,
         upower: Option<Connection>,
         notifications: Option<Connection>,
+        /// Instances that gave up the service but stay connected.
+        former: Vec<Connection>,
         log: Arc<Mutex<Vec<String>>>,
+        /// The calls of each instance of the service, in order.
+        calls: Vec<Calls>,
+        gate: Arc<Gate<()>>,
     }
 
     impl World {
@@ -1192,7 +1316,10 @@ pub(crate) mod tests {
                 address: address.clone(),
                 upower: None,
                 notifications: None,
+                former: Vec::new(),
                 log: Arc::default(),
+                calls: Vec::new(),
+                gate: Arc::default(),
             };
             world.start_upower(display);
             world.start_notifications();
@@ -1234,8 +1361,12 @@ pub(crate) mod tests {
                 zbus::block_on(old.release_name("org.freedesktop.Notifications")).unwrap();
             }
             let address = self.address.clone();
+            let calls = Calls::default();
+            self.calls.push(calls.clone());
             let server = FakeNotifications {
                 log: self.log.clone(),
+                calls,
+                gate: self.gate.clone(),
                 next_id: 0,
             };
             self.notifications = Some(
@@ -1248,6 +1379,15 @@ pub(crate) mod tests {
                 })
                 .unwrap(),
             );
+        }
+
+        /// Hand the notification service over to a new instance. The old
+        /// one stays connected, to answer what it was asked before.
+        fn hand_over(&mut self) {
+            let old = self.notifications.take().unwrap();
+            zbus::block_on(old.release_name("org.freedesktop.Notifications")).unwrap();
+            self.former.push(old);
+            self.start_notifications();
         }
 
         /// The notification service closes a notification by itself.
@@ -1364,5 +1504,43 @@ pub(crate) mod tests {
         world.expect(log, &[]);
         world.burst(&[&[("WarningLevel", Value::U32(1))]]);
         world.expect(log, &[]);
+    }
+
+    /// The notification service changes hands while the old instance still
+    /// owes the daemon an answer, and the UPS is back on mains power: the
+    /// old instance's id never reaches the new one.
+    #[test]
+    fn ids_stay_with_the_instance_that_issued_them() {
+        let mut world = World::new(FakeDevice {
+            kind: KIND_UPS,
+            warning_level: 2,
+            percentage: 80.0,
+            time_to_empty: 600,
+        });
+        let discharging = |percentage: u32| {
+            format!(
+                "UPS Discharging: 10 minutes of UPS backup power remaining ({percentage}%) (urgency 1)"
+            )
+        };
+        world.expect(&mut Vec::new(), &[&format!("notify 1 {}", discharging(80))]);
+        let gate = world.gate.clone();
+        let held = zbus::block_on(gate.lock());
+        world.burst(&[&[("Percentage", Value::F64(70.0))]]);
+        std::thread::sleep(Duration::from_millis(200));
+        world.burst(&[&[("WarningLevel", Value::U32(1))]]);
+        world.hand_over();
+        drop(held);
+        assert_eq!(wait_up(&world.calls[1], &[]), Vec::<String>::new());
+        // The next warning is the new instance's, and closed there.
+        world.burst(&[&[("WarningLevel", Value::U32(2))]]);
+        assert_eq!(
+            wait_up(&world.calls[1], &[&discharging(70)]),
+            [discharging(70)]
+        );
+        world.burst(&[&[("WarningLevel", Value::U32(1))]]);
+        assert_eq!(wait_up(&world.calls[1], &[]), Vec::<String>::new());
+        for (instance, calls) in world.calls.iter().enumerate() {
+            assert_own_ids(instance, calls);
+        }
     }
 }

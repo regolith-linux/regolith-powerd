@@ -14,7 +14,8 @@
 //! changes are applied signal by signal, in the order UPower sends them. A
 //! level is on record as announced only once the notification server took
 //! the warning. The notification service may start late or restart; the
-//! warnings up when it went away are shown again on its successor.
+//! warnings up when it went away are shown again on its successor. An id is
+//! only ever replaced or closed through the instance that issued it.
 
 use glib::g_log;
 use std::collections::HashMap;
@@ -23,13 +24,11 @@ use zbus::export::futures_util::stream::{self, SelectAll, Stream};
 use zbus::export::futures_util::StreamExt;
 use zbus::export::ordered_stream::{self, OrderedStreamExt};
 use zbus::fdo::{DBusProxy, PropertiesChanged, PropertiesProxy};
-use zbus::names::InterfaceName;
+use zbus::names::{InterfaceName, OwnedUniqueName};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream, MessageType};
 
-use crate::battery::{
-    service_events, NotificationsProxy, ServiceEvent, UPowerProxy, Warning, APP_NAME,
-};
+use crate::battery::{close, notify, service_events, Issued, ServiceEvent, UPowerProxy, Warning};
 
 const UPOWER: &str = "org.freedesktop.UPower";
 const DEVICE_INTERFACE: &str = "org.freedesktop.UPower.Device";
@@ -231,13 +230,13 @@ enum Event {
 type Events = SelectAll<Pin<Box<dyn Stream<Item = Event>>>>;
 
 /// A device's warning, from the notification service's side.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 struct Shown {
     /// The severity of the warning the service accepted and still has up.
     severity: Option<Severity>,
-    /// Its id with the current instance of the service; `None` while it
-    /// still has to be shown again on a new instance.
-    id: Option<u32>,
+    /// Its id, with the instance of the service that issued it; `None`
+    /// while it still has to be shown again on a new instance.
+    id: Option<Issued>,
     /// An escalation above what was announced that has not been accepted
     /// yet: there was no service, or `Notify` failed.
     pending: Option<Severity>,
@@ -298,10 +297,10 @@ impl Warnings {
 
 struct Watcher<'a> {
     system: &'a Connection,
+    session: &'a Connection,
     upower: UPowerProxy<'static>,
-    notifications: NotificationsProxy<'static>,
     /// The notification service's current owner, if any.
-    owner: Option<String>,
+    owner: Option<OwnedUniqueName>,
     followed: HashMap<OwnedObjectPath, Followed>,
     warnings: Warnings,
 }
@@ -357,8 +356,8 @@ impl Watcher<'_> {
             Ok(read) => read,
             Err(e) => {
                 g_log!(glib::LogLevel::Debug, "Cannot read {}: {e}", path.as_str());
-                if let Some(id) = shown.id {
-                    close(&self.notifications, id).await;
+                if let Some(id) = &shown.id {
+                    close(self.session, id).await;
                 }
                 return;
             }
@@ -433,8 +432,8 @@ impl Watcher<'_> {
                     self.warnings.recovered(&identity);
                 }
                 let shown = std::mem::take(&mut followed.shown);
-                if let Some(id) = shown.id {
-                    close(&self.notifications, id).await;
+                if let Some(id) = &shown.id {
+                    close(self.session, id).await;
                 }
             }
             Action::Settle => followed.shown.pending = None,
@@ -450,8 +449,8 @@ impl Watcher<'_> {
         let Some(followed) = self.followed.get_mut(path) else {
             return;
         };
-        let shown = followed.shown;
-        let severity = match (shown.pending, shown.severity, shown.id) {
+        let shown = followed.shown.clone();
+        let severity = match (shown.pending, shown.severity, &shown.id) {
             (Some(severity), _, _) => severity,
             (None, Some(severity), None) => severity,
             _ => return,
@@ -459,20 +458,7 @@ impl Watcher<'_> {
         let state = &followed.state;
         let warning = warning(severity, state.kind, state.percentage, state.battery_level);
         // A critical warning takes the place of the low one.
-        match self
-            .notifications
-            .notify(
-                APP_NAME,
-                shown.id.unwrap_or(0),
-                warning.icon,
-                &warning.summary,
-                &warning.body,
-                &[],
-                warning.hints(),
-                warning.timeout_ms,
-            )
-            .await
-        {
+        match notify(self.session, &warning, shown.id.as_ref()).await {
             Ok(id) => {
                 followed.shown = Shown {
                     severity: Some(severity),
@@ -497,33 +483,38 @@ impl Watcher<'_> {
     /// was announced for it is kept.
     async fn remove(&mut self, path: &OwnedObjectPath) {
         if let Some(followed) = self.followed.remove(path) {
-            if let Some(id) = followed.shown.id {
-                close(&self.notifications, id).await;
+            if let Some(id) = &followed.shown.id {
+                close(self.session, id).await;
             }
         }
     }
 
     async fn service(&mut self, event: ServiceEvent) {
         match event {
-            ServiceEvent::Closed(id) => {
+            ServiceEvent::Closed(closed) => {
                 // Dead from now on: never replaced, never closed.
                 for followed in self.followed.values_mut() {
-                    if followed.shown.id == Some(id) {
+                    if followed.shown.id.as_ref() == Some(&closed) {
                         followed.shown.id = None;
                         followed.shown.severity = None;
                     }
                 }
             }
-            ServiceEvent::Owner(owner) => {
+            ServiceEvent::Owner { gone, owner } => {
+                if let Some(gone) = gone {
+                    // The ids of the instance that lost the service mean
+                    // nothing to the next one; what it had up is shown
+                    // again there. An id the next one issued (it may have
+                    // answered before this news came) stays.
+                    for followed in self.followed.values_mut() {
+                        let shown = &mut followed.shown;
+                        if shown.id.as_ref().is_some_and(|id| id.is_from(&gone)) {
+                            shown.id = None;
+                        }
+                    }
+                }
                 if owner == self.owner {
                     return;
-                }
-                if self.owner.is_some() {
-                    // The old instance's ids mean nothing to the next one;
-                    // what it had up is shown again there.
-                    for followed in self.followed.values_mut() {
-                        followed.shown.id = None;
-                    }
                 }
                 self.owner = owner;
                 if self.owner.is_some() {
@@ -547,17 +538,10 @@ impl Watcher<'_> {
     }
 }
 
-async fn close(notifications: &NotificationsProxy<'_>, id: u32) {
-    if let Err(e) = notifications.close_notification(id).await {
-        g_log!(glib::LogLevel::Debug, "Cannot close notification: {e}");
-    }
-}
-
 /// Follow UPower's devices and notify until a connection fails.
 pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()> {
     let upower = UPowerProxy::new(system).await?;
     let dbus = DBusProxy::new(system).await?;
-    let notifications = NotificationsProxy::new(session).await?;
 
     // Subscribe before enumerating, so that no device slips through.
     let mut events: Events = SelectAll::new();
@@ -630,8 +614,8 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
 
     let mut watcher = Watcher {
         system,
+        session,
         upower,
-        notifications,
         owner,
         followed: HashMap::new(),
         warnings: Warnings::default(),
@@ -855,10 +839,11 @@ mod tests {
         }
     }
 
-    use crate::battery::tests::{private_bus, Bus};
+    use crate::battery::tests::{assert_own_ids, private_bus, wait_up, Bus, Call, Calls};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+    use zbus::export::futures_util::lock::Mutex as Gate;
     use zbus::zvariant::ObjectPath;
     use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
 
@@ -908,19 +893,21 @@ mod tests {
     }
 
     /// A notification server that records what it is asked to do, refuses
-    /// to show anything while `refuse` is set, and takes `delay_ms` to show
-    /// a notification.
+    /// to show anything while `refuse` is set, takes `delay_ms` to show a
+    /// notification and holds back its answer while `gate` is locked.
     struct FakeNotifications {
         log: Arc<Mutex<Vec<String>>>,
+        calls: Calls,
         refuse: Arc<AtomicBool>,
         delay_ms: Arc<AtomicU64>,
+        gate: Arc<Gate<()>>,
         next_id: u32,
     }
 
     #[dbus_interface(name = "org.freedesktop.Notifications")]
     impl FakeNotifications {
         #[allow(clippy::too_many_arguments)]
-        fn notify(
+        async fn notify(
             &mut self,
             _app_name: &str,
             replaces_id: u32,
@@ -932,9 +919,8 @@ mod tests {
             _expire_timeout: i32,
         ) -> zbus::fdo::Result<u32> {
             std::thread::sleep(Duration::from_millis(self.delay_ms.load(Ordering::SeqCst)));
-            let mut log = self.log.lock().unwrap();
             if self.refuse.load(Ordering::SeqCst) {
-                log.push(format!("refused {summary}"));
+                self.log.lock().unwrap().push(format!("refused {summary}"));
                 return Err(zbus::fdo::Error::Failed("refused".into()));
             }
             let id = if replaces_id == 0 {
@@ -943,13 +929,22 @@ mod tests {
             } else {
                 replaces_id
             };
-            log.push(format!(
-                "notify {id} replaces {replaces_id} {summary}: {body}"
-            ));
+            let text = format!("{summary}: {body}");
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("notify {id} replaces {replaces_id} {text}"));
+            self.calls.lock().unwrap().push(Call::Notify {
+                id,
+                replaces: replaces_id,
+                text,
+            });
+            let _open = self.gate.lock().await;
             Ok(id)
         }
         fn close_notification(&mut self, id: u32) {
             self.log.lock().unwrap().push(format!("close {id}"));
+            self.calls.lock().unwrap().push(Call::Close(id));
         }
         #[dbus_interface(signal)]
         async fn notification_closed(
@@ -988,9 +983,14 @@ mod tests {
         address: String,
         upower: Connection,
         notifications: Option<Connection>,
+        /// Instances that gave up the service but stay connected.
+        former: Vec<Connection>,
         log: Arc<Mutex<Vec<String>>>,
+        /// The calls of each instance of the service, in order.
+        calls: Vec<Calls>,
         refuse: Arc<AtomicBool>,
         delay_ms: Arc<AtomicU64>,
+        gate: Arc<Gate<()>>,
     }
 
     impl World {
@@ -1015,9 +1015,12 @@ mod tests {
                 address,
                 upower,
                 notifications: None,
+                former: Vec::new(),
                 log: Arc::default(),
+                calls: Vec::new(),
                 refuse: Arc::default(),
                 delay_ms: Arc::default(),
+                gate: Arc::default(),
             };
             if notifications {
                 world.start_notifications();
@@ -1042,10 +1045,14 @@ mod tests {
             if let Some(old) = self.notifications.take() {
                 zbus::block_on(old.release_name("org.freedesktop.Notifications")).unwrap();
             }
+            let calls = Calls::default();
+            self.calls.push(calls.clone());
             let server = FakeNotifications {
                 log: self.log.clone(),
+                calls,
                 refuse: self.refuse.clone(),
                 delay_ms: self.delay_ms.clone(),
+                gate: self.gate.clone(),
                 next_id: 0,
             };
             let address = self.address.clone();
@@ -1059,6 +1066,15 @@ mod tests {
                 })
                 .unwrap(),
             );
+        }
+
+        /// Hand the notification service over to a new instance. The old
+        /// one stays connected, to answer what it was asked before.
+        fn hand_over(&mut self) {
+            let old = self.notifications.take().unwrap();
+            zbus::block_on(old.release_name("org.freedesktop.Notifications")).unwrap();
+            self.former.push(old);
+            self.start_notifications();
         }
 
         /// The notification service closes a notification by itself.
@@ -1400,5 +1416,41 @@ mod tests {
                 "notify 2 replaces 0 Keyboard battery low: Wireless keyboard is low on power (8%)",
             ],
         );
+    }
+
+    /// The notification service changes hands while the old instance still
+    /// owes the daemon an answer, and another device recovers: no id of the
+    /// old instance reaches the new one, which shows what is still up.
+    #[test]
+    fn ids_stay_with_the_instance_that_issued_them() {
+        let keyboard = State {
+            kind: 6,
+            warning_level: 1,
+            percentage: 10.0,
+            battery_level: 1,
+            serial: "K1".into(),
+        };
+        let mut world = World::new(&[(MOUSE, mouse(3, 9.0)), (KEYBOARD, keyboard)], true);
+        world.expect(
+            &mut Vec::new(),
+            &[&format!("notify 1 replaces 0 {MOUSE_LOW} (9%)")],
+        );
+        let gate = world.gate.clone();
+        let held = zbus::block_on(gate.lock());
+        world.set_level(KEYBOARD, 3, 10.0);
+        std::thread::sleep(Duration::from_millis(200));
+        world.set_level(MOUSE, 1, 50.0);
+        world.hand_over();
+        drop(held);
+        let keyboard_low = "Keyboard battery low: Wireless keyboard is low on power (10%)";
+        assert_eq!(wait_up(&world.calls[1], &[keyboard_low]), [keyboard_low]);
+        // Both devices are followed on the new instance.
+        world.set_level(KEYBOARD, 1, 50.0);
+        world.set_level(MOUSE, 3, 9.0);
+        let mouse_low = format!("{MOUSE_LOW} (9%)");
+        assert_eq!(wait_up(&world.calls[1], &[&mouse_low]), [mouse_low]);
+        for (instance, calls) in world.calls.iter().enumerate() {
+            assert_own_ids(instance, calls);
+        }
     }
 }
