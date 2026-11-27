@@ -13,6 +13,7 @@ use swayipc;
 
 mod battery;
 mod end_session;
+mod location;
 mod logind;
 mod monitor_labels;
 mod power_source;
@@ -1163,6 +1164,10 @@ fn main() {
     // The lock screen's D-Bus interface, which gnome-flashback provides in
     // the X11 session. It runs in a thread of its own.
     screensaver::start();
+
+    // The location agent that GeoClue waits for before it serves this user,
+    // which GNOME Shell is in GNOME. It runs in a thread of its own.
+    location::start();
 
     let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
 
