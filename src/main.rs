@@ -13,6 +13,7 @@ use swayipc;
 
 mod battery;
 mod end_session;
+mod idle_monitor;
 mod logind;
 mod monitor_labels;
 mod power_source;
@@ -1163,6 +1164,12 @@ fn main() {
     // The lock screen's D-Bus interface, which gnome-flashback provides in
     // the X11 session. It runs in a thread of its own.
     screensaver::start();
+
+    // The idle monitor that gnome-session's presence and other GNOME
+    // components ask for idle time, which gnome-flashback provides in the
+    // X11 session. It follows sway's idle notifications in threads of its
+    // own.
+    idle_monitor::start();
 
     let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
 
