@@ -312,6 +312,12 @@ impl<'a> Notifier<'a> {
         }
     }
 
+    /// Who owns the service, as of the news taken in so far: before any
+    /// notice, who owned it when the subscription began.
+    pub(crate) fn owner(&self) -> Option<&OwnedUniqueName> {
+        self.owner.as_ref()
+    }
+
     /// The next notice to apply, if one has arrived, in the order the bus
     /// delivered them.
     pub(crate) fn ready(&mut self) -> Option<Notice> {

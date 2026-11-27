@@ -14,7 +14,8 @@
 //! changes are applied signal by signal, in the order UPower sends them. A
 //! level is on record as announced only once the notification server took
 //! the warning. The notification service may start late or restart; the
-//! warnings up when it went away are shown again on its successor. An id is
+//! warnings up when it went away are shown again on its successor, once:
+//! one it refuses is not up any more, and is not made up for. An id is
 //! only ever replaced or closed through the instance that issued it, and
 //! never once it died: the service's news is taken in even while the daemon
 //! waits for an answer. A slow answer holds up only the device it is about:
@@ -29,7 +30,7 @@ use zbus::export::futures_util::stream::{self, Stream};
 use zbus::export::futures_util::StreamExt;
 use zbus::export::ordered_stream::{self, OrderedStreamExt};
 use zbus::fdo::{DBusProxy, PropertiesChanged, PropertiesProxy};
-use zbus::names::InterfaceName;
+use zbus::names::{InterfaceName, OwnedUniqueName};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream, MessageType};
 
@@ -236,7 +237,8 @@ enum Event {
 /// A device's warning, from the notification service's side.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Shown {
-    /// The severity of the warning the service accepted and still has up.
+    /// The severity of the warning the service accepted and still has up,
+    /// or that is still to be shown again on a new instance.
     severity: Option<Severity>,
     /// Its id, with the instance of the service that issued it; `None`
     /// while it still has to be shown again on a new instance.
@@ -339,6 +341,8 @@ struct Watcher<'a> {
     system: &'a Connection,
     upower: UPowerProxy<'static>,
     notifier: Notifier<'a>,
+    /// Who owns the notification service, as of the news applied.
+    owner: Option<OwnedUniqueName>,
     followed: HashMap<OwnedObjectPath, Followed>,
     warnings: Warnings,
     /// Whether a notification service appeared, to show again there what
@@ -614,11 +618,11 @@ impl Watcher<'_> {
             // The instance that took it lost the service before it answered:
             // not shown, and so not announced either.
             Ok(Outcome::Lost) if showing.rise => {
-                // The escalation took the place of the warning it was to
-                // replace, which went with that instance. It is still owed
-                // to the next one; nothing else is up meanwhile.
+                // Still owed to the next instance, and so is the warning it
+                // was to replace, which went with that instance: what the
+                // level calls for by then is shown there.
                 Shown {
-                    severity: None,
+                    severity: followed.shown.severity,
                     id: None,
                     pending: Some(showing.severity),
                 }
@@ -629,13 +633,23 @@ impl Watcher<'_> {
                 id: None,
                 pending: None,
             },
-            // Not announced: what was announced before still stands, and
-            // the next change, or a new notification service, tries again.
+            // Not announced: what was announced before still stands.
             Err(e) => {
                 g_log!(
                     glib::LogLevel::Warning,
                     "Cannot show device battery warning: {e}"
                 );
+                // The instance that has the service refused it: nothing is
+                // owed any more, the next rise tries again. A warning that
+                // was only to be shown again there is not up anywhere now,
+                // and is not made up for. Without an owner (the bus
+                // answered), it still goes out when one appears.
+                if refused_by(&e, self.owner.as_ref()) {
+                    followed.shown.pending = None;
+                    if followed.shown.id.is_none() {
+                        followed.shown.severity = None;
+                    }
+                }
                 return;
             }
         };
@@ -697,6 +711,7 @@ impl Watcher<'_> {
                 if owner.is_some() {
                     self.reshow = true;
                 }
+                self.owner = owner;
             }
         }
     }
@@ -712,6 +727,22 @@ impl Watcher<'_> {
             Event::Changed(path, changes) => self.step(Step::Changed(path, changes)).await,
         }
     }
+}
+
+/// Whether `error` is the answer of `owner`, the instance that has the
+/// service: it refused the warning. The bus answers when there is no owner,
+/// or the owner went away before answering.
+fn refused_by(error: &zbus::Error, owner: Option<&OwnedUniqueName>) -> bool {
+    let zbus::Error::MethodError(_, _, reply) = error else {
+        return false;
+    };
+    let Ok(header) = reply.header() else {
+        return false;
+    };
+    matches!(
+        (header.sender(), owner),
+        (Ok(Some(sender)), Some(owner)) if sender == owner.inner()
+    )
 }
 
 /// What the device warnings wait for.
@@ -797,6 +828,7 @@ pub async fn watch(system: &Connection, session: &Connection) -> zbus::Result<()
     let mut watcher = Watcher {
         system,
         upower,
+        owner: notifier.owner().cloned(),
         notifier,
         followed: HashMap::new(),
         warnings: Warnings::default(),
@@ -1769,5 +1801,55 @@ mod tests {
             &[&format!("notify 1 replaces 0 {}", mouse_critical(4))],
         );
         assert_eq!(world.calls[1].lock().unwrap().len(), 1);
+    }
+
+    /// The critical warning is answered only after its instance lost the
+    /// service, and the mouse is back at low by then: the next instance
+    /// shows the low warning, afresh. The next rise escalates there.
+    #[test]
+    fn a_critical_answered_too_late_leaves_the_low_one_owed() {
+        let mut world = World::new(&[(MOUSE, mouse(3, 9.0))], true);
+        let log = &mut Vec::new();
+        world.expect(log, &[&format!("notify 1 replaces 0 {MOUSE_LOW} (9%)")]);
+        let gate = world.gate.clone();
+        let held = zbus::block_on(gate.lock());
+        world.set_level(MOUSE, 4, 4.0);
+        world.expect(
+            log,
+            &[&format!("notify 1 replaces 1 {}", mouse_critical(4))],
+        );
+        world.set_level(MOUSE, 3, 8.0);
+        world.hand_over();
+        // Nothing goes to the next instance before the answer is in.
+        world.expect(log, &[]);
+        drop(held);
+        world.expect(log, &[&format!("notify 1 replaces 0 {MOUSE_LOW} (8%)")]);
+        world.set_level(MOUSE, 4, 4.0);
+        world.expect(
+            log,
+            &[&format!("notify 1 replaces 1 {}", mouse_critical(4))],
+        );
+        assert_eq!(world.calls[1].lock().unwrap().len(), 2);
+    }
+
+    /// The next instance of the service refuses to show again the warning
+    /// that was up: it is not made up for at the next report that announces
+    /// nothing new. The next rise escalates.
+    #[test]
+    fn a_refused_warning_is_shown_again_once() {
+        let mut world = World::new(&[(MOUSE, mouse(3, 9.0))], true);
+        let log = &mut Vec::new();
+        world.expect(log, &[&format!("notify 1 replaces 0 {MOUSE_LOW} (9%)")]);
+        world.refuse.store(true, Ordering::SeqCst);
+        world.hand_over();
+        world.expect(log, &["refused Mouse battery low"]);
+        world.refuse.store(false, Ordering::SeqCst);
+        world.set_level(MOUSE, 3, 8.0);
+        world.expect(log, &[]);
+        world.set_level(MOUSE, 4, 4.0);
+        world.expect(
+            log,
+            &[&format!("notify 1 replaces 0 {}", mouse_critical(4))],
+        );
     }
 }
