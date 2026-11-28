@@ -4,12 +4,16 @@ use gsettings_macro::gen_settings;
 use std::{
     cell::Cell,
     error::Error,
+    fs,
     mem::ManuallyDrop,
+    os::unix::process::CommandExt,
+    path::PathBuf,
     process::{Child, Command},
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant, SystemTime},
 };
 use swayipc;
+use zbus::export::futures_util::future;
 
 mod battery;
 mod end_session;
@@ -26,12 +30,14 @@ mod prompter;
 mod secret_exchange;
 
 /// What decides the idle actions besides the settings: the power source
-/// (UPower's `OnBattery`) and whether a GNOME application inhibits suspend.
-/// gnome-settings-daemon re-arms its idle timers when either changes.
+/// (UPower's `OnBattery`). gnome-settings-daemon re-arms its idle timers
+/// when it changes. Whether a GNOME application inhibits suspend is checked
+/// when the sleep-inactive action is due (see [`SUSPEND_NOT_INHIBITED`]);
+/// the session inhibition bridge has the timers re-armed when that changes
+/// on an unlocked screen (see [`crate::session`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IdleContext {
     pub on_battery: bool,
-    pub suspend_inhibited: bool,
 }
 
 /// Shared idle context plus a way to ask the manager to re-arm the timers.
@@ -39,14 +45,77 @@ pub struct IdleContext {
 pub struct IdleState {
     context: Rc<Cell<IdleContext>>,
     reload: async_channel::Sender<()>,
+    /// Restart swayidle at the next reload even if its arguments stay the same.
+    restart: Rc<Cell<bool>>,
+    /// Undo what swayidle's timeouts did, at the next reload.
+    wake: Rc<Cell<bool>>,
+    /// When a suspend inhibitor went away on a locked screen, for the next
+    /// reload to run an overdue sleep-inactive action (see
+    /// [`run_overdue_sleep`]).
+    overdue_sleep: Rc<Cell<Option<Instant>>>,
+    /// When an idle inhibitor went away on a locked screen, for the next
+    /// reload to count the sleep-inactive action from then (see
+    /// [`sleep_from`]).
+    idle_dropped: Rc<Cell<Option<Instant>>>,
+    /// The latest such moment the sleep-inactive action counts from: an
+    /// earlier count gives way to it.
+    sleep_counts_from: Rc<Cell<Option<Instant>>>,
+    /// One message per startup step done (see [`STARTUP_STEPS`]).
+    startup_steps: async_channel::Receiver<()>,
+    startup_steps_tx: async_channel::Sender<()>,
 }
 
 impl IdleState {
     fn new(reload: async_channel::Sender<()>) -> Self {
+        let (startup_steps_tx, startup_steps) = async_channel::bounded(STARTUP_STEPS);
         Self {
             context: Rc::new(Cell::new(IdleContext::default())),
             reload,
+            restart: Rc::new(Cell::new(false)),
+            wake: Rc::new(Cell::new(false)),
+            overdue_sleep: Rc::new(Cell::new(None)),
+            idle_dropped: Rc::new(Cell::new(None)),
+            sleep_counts_from: Rc::new(Cell::new(None)),
+            startup_steps,
+            startup_steps_tx,
         }
+    }
+
+    /// Report one of the [`STARTUP_STEPS`] done (or given up). Never blocks.
+    pub fn startup_step_done(&self) {
+        let _ = self.startup_steps_tx.try_send(());
+    }
+
+    /// Ask for swayidle to be restarted, even if its arguments stay the same:
+    /// its idle countdowns start over, and stopping it runs the resume command
+    /// of every timeout that has fired (see [`stop_swayidle`]), which
+    /// brightens a dimmed screen and turns the outputs back on. Never blocks.
+    pub fn request_restart(&self) {
+        self.restart.set(true);
+        self.request_reload();
+    }
+
+    /// Ask for what swayidle's timeouts did to be undone, without restarting
+    /// it (see [`wake_cmd`]). Never blocks.
+    pub fn request_wake(&self) {
+        self.wake.set(true);
+        self.request_reload();
+    }
+
+    /// Ask for the sleep-inactive action to run if it was already overdue
+    /// when a suspend inhibitor went away on a locked screen at `since`,
+    /// without restarting swayidle (see [`run_overdue_sleep`]). Never blocks.
+    pub fn request_overdue_sleep(&self, since: Instant) {
+        self.overdue_sleep.set(Some(since));
+        self.request_reload();
+    }
+
+    /// Ask for the sleep-inactive action to count from `since`, when an idle
+    /// inhibitor went away on a locked screen then, without restarting
+    /// swayidle (see [`sleep_from`]). Never blocks.
+    pub fn request_sleep_from(&self, since: Instant) {
+        self.idle_dropped.set(Some(since));
+        self.request_reload();
     }
 
     pub fn get(&self) -> IdleContext {
@@ -179,14 +248,45 @@ impl Manager {
         let mut sway_idle_child: Option<Child> = None;
         let mut current_args: Option<Vec<String>> = None;
         glib::spawn_future_local(async move {
+            // Marks left by an earlier daemon's swayidle tell nothing about
+            // this one's idle time.
+            for mark in [IDLE_MARK, SLEEP_DUE_MARK, SLEEP_HELD_UNTIL] {
+                if let Some(path) = runtime_path(mark) {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            self.idle.startup().await;
             while let Ok(_) = recv_reload_event.recv().await {
                 // Restarting swayidle starts its idle count again, so keep
                 // the running one when nothing it runs has changed (for
-                // example a power-source change with the same action).
+                // example a power-source change with the same action),
+                // unless a restart was asked for.
+                if self.idle.wake.take() {
+                    run_shell(&wake_cmd(), "turn the screen on").await;
+                }
+                // First, so that an overdue action (below) finds the hold.
+                if let Some(since) = self.idle.idle_dropped.take() {
+                    self.idle.sleep_counts_from.set(Some(since));
+                    if let Some((timeout, action)) = self.sleep_from_cmd() {
+                        let (due, hold) = hold_sleep(since, timeout);
+                        let counts_from = self.idle.sleep_counts_from.clone();
+                        glib::spawn_future_local(async move {
+                            sleep_from(since, due, hold, &action, &counts_from).await
+                        });
+                    }
+                }
+                if let Some(since) = self.idle.overdue_sleep.take() {
+                    if let Some((_, action, _)) = self.sleep_cmds() {
+                        glib::spawn_future_local(
+                            async move { run_overdue_sleep(since, &action).await },
+                        );
+                    }
+                }
+                let restart = self.idle.restart.take();
                 let running = sway_idle_child
                     .as_mut()
                     .is_some_and(|c| matches!(c.try_wait(), Ok(None)));
-                if running && current_args.as_ref() == Some(&self.get_swayidle_args()) {
+                if running && !restart && current_args.as_ref() == Some(&self.get_swayidle_args()) {
                     continue;
                 }
                 if let Some(mut prev_child) = sway_idle_child.take() {
@@ -194,11 +294,17 @@ impl Manager {
                 }
                 let swayidle_args = self.get_swayidle_args();
                 current_args = Some(swayidle_args.clone());
-                let child = Command::new("swayidle")
-                    .arg("-w")
-                    .args(swayidle_args)
-                    .spawn();
-                sway_idle_child = child.ok();
+                let mut command = Command::new("swayidle");
+                command.arg("-w").args(swayidle_args);
+                // SAFETY: the closure only makes system calls, as is
+                // allowed between fork and exec.
+                unsafe {
+                    command.pre_exec(|| {
+                        close_inherited_fds_on_exec();
+                        Ok(())
+                    });
+                }
+                sway_idle_child = command.spawn().ok();
                 g_log!(glib::LogLevel::Info, "Swayidle Reloaded");
             }
         });
@@ -218,23 +324,31 @@ impl Manager {
             self.power_settings.idle_dim(),
         );
 
+        // While a GNOME application inhibits idleness, the screen doesn't
+        // dim, turn off or lock on the usual idle times. swayidle holds them
+        // back itself through logind's idle lock while the screen is unlocked;
+        // on a locked screen, where only the locked-screen blanking goes on,
+        // they leave themselves out (as does the sleep-inactive action, see
+        // [`Self::sleep_cmds`]). In the background nothing runs at all.
+        let usual_idle = [SESSION_IN_FOREGROUND, IDLE_NOT_INHIBITED];
+
         if let Some(dim_timeout_sec) = times.dim {
             let idle_brightness = self.power_settings.idle_brightness();
             let action = format!(
                 r#"
                 export curr_brightness=$(light)
-                echo $curr_brightness | tee $XDG_RUNTIME_DIR/screen_brightness_old.var
+                echo $curr_brightness | tee {DIM_SAVED_BRIGHTNESS}
                 if [ 1 -eq "$(echo "${{curr_brightness}} > {idle_brightness}" | bc)" ]; then
                     light -S {idle_brightness}
-                fi
-                "#,
+                fi"#,
             );
 
-            // Dim screen to $idle_brightness when idle dim timeout hit
-            let mut swayidle_dim_timeout_args = Self::get_timeout_cmd(dim_timeout_sec, &action);
-            let mut swayidle_dim_resume_args = Self::get_resume_cmd(&format!(
-                "light -S $(cat $XDG_RUNTIME_DIR/screen_brightness_old.var)"
-            ));
+            // Dim screen to $idle_brightness when idle dim timeout hit, and
+            // restore the brightness saved then (once: a dim left out above
+            // saves none)
+            let mut swayidle_dim_timeout_args =
+                Self::get_timeout_cmd(dim_timeout_sec, &only_if(&usual_idle, action.trim()));
+            let mut swayidle_dim_resume_args = Self::get_resume_cmd(&restore_dim_cmd());
             args.append(&mut swayidle_dim_timeout_args);
             args.append(&mut swayidle_dim_resume_args);
         }
@@ -247,7 +361,7 @@ impl Manager {
 
         if let Some(display_off_timeout_sec) = times.blank {
             let mut swayidle_display_off_timeout_args =
-                Self::get_timeout_cmd(display_off_timeout_sec, &display_off);
+                Self::get_timeout_cmd(display_off_timeout_sec, &only_if(&usual_idle, &display_off));
             let mut swayidle_display_off_resume_args = Self::get_resume_cmd(&display_on);
             args.append(&mut swayidle_display_off_timeout_args);
             args.append(&mut swayidle_display_off_resume_args);
@@ -257,7 +371,7 @@ impl Manager {
                 let lock_delay_sec = self.screensaver_settings.lock_delay();
                 let lock_timeout_sec = display_off_timeout_sec.saturating_add(lock_delay_sec);
                 let mut swayidle_lock_timeout_args =
-                    Self::get_timeout_cmd(lock_timeout_sec, &lock_screen);
+                    Self::get_timeout_cmd(lock_timeout_sec, &only_if(&usual_idle, &lock_screen));
                 args.append(&mut swayidle_lock_timeout_args);
             }
         }
@@ -266,20 +380,23 @@ impl Manager {
         // is set to
         args.append(&mut blank_while_locked_args());
 
-        if let Some(sleep) = Self::sleep_timeout(
-            self.idle.get(),
-            self.power_settings.sleep_inactive_ac_type(),
-            self.power_settings.sleep_inactive_ac_timeout(),
-            self.power_settings.sleep_inactive_battery_type(),
-            self.power_settings.sleep_inactive_battery_timeout(),
-        ) {
-            let mut swayidle_timeout_args = Self::get_timeout_cmd(sleep.timeout, sleep.action);
+        // Whether the user has been idle since a lock, for the fresh-lock
+        // blank (see [`blank_fresh_lock`])
+        args.append(&mut idle_mark_args());
+
+        if let Some((timeout, action, resume)) = self.sleep_cmds() {
+            // The mark tells [`run_overdue_sleep`] that the timeout has
+            // passed with no input since.
+            let mut swayidle_timeout_args =
+                Self::get_timeout_cmd(timeout, &format!("touch {SLEEP_DUE_MARK}; {action}"));
             args.append(&mut swayidle_timeout_args);
 
-            if let Some(resume_action) = sleep.resume {
-                let mut swayidle_resume_args = Self::get_resume_cmd(resume_action);
-                args.append(&mut swayidle_resume_args);
-            }
+            let resume = match resume {
+                Some(resume_action) => format!("rm -f {SLEEP_DUE_MARK}; {resume_action}"),
+                None => format!("rm -f {SLEEP_DUE_MARK}"),
+            };
+            let mut swayidle_resume_args = Self::get_resume_cmd(&resume);
+            args.append(&mut swayidle_resume_args);
         }
 
         let pause_audio = format!("playerctl -a pause");
@@ -300,6 +417,51 @@ impl Manager {
         args
     }
 
+    /// The sleep-inactive action swayidle arms, as (timeout, guarded command,
+    /// resume command), see [`Self::sleep_timeout`].
+    ///
+    /// It is held back while a GNOME application inhibits idleness, locked or
+    /// not: in the X11 session the idle monitor stops counting idle time
+    /// then, so gnome-settings-daemon's sleep timer never fires. Unlocked,
+    /// logind's idle lock holds it back too; on a locked screen only the test
+    /// here does. When the inhibitor goes away on a locked screen, the action
+    /// counts from then (see [`sleep_from`]).
+    ///
+    /// A suspend or hibernate action is held back while a GNOME application
+    /// inhibits suspend: that inhibition holds back automatic suspend only,
+    /// so logind's lock for it is weak and explicit requests (power button,
+    /// keybinding) still go through. The tests are made when the action is
+    /// due, so that a change of these inhibitors needs no new swayidle: on a
+    /// locked screen a new one would start the lock screen's blank delays
+    /// over, and stopping the old one would turn the outputs back on.
+    fn sleep_cmds(&self) -> Option<(u32, String, Option<&'static str>)> {
+        let sleep = Self::sleep_timeout(
+            self.idle.get(),
+            self.power_settings.sleep_inactive_ac_type(),
+            self.power_settings.sleep_inactive_ac_timeout(),
+            self.power_settings.sleep_inactive_battery_type(),
+            self.power_settings.sleep_inactive_battery_timeout(),
+        )?;
+        Some((sleep.timeout, guarded_sleep_cmd(sleep.action), sleep.resume))
+    }
+
+    /// The sleep-inactive action as [`sleep_from`] runs it, as (timeout,
+    /// guarded command): the hold it set itself (see [`SLEEP_NOT_HELD`]) is
+    /// left out.
+    fn sleep_from_cmd(&self) -> Option<(u32, String)> {
+        let sleep = Self::sleep_timeout(
+            self.idle.get(),
+            self.power_settings.sleep_inactive_ac_type(),
+            self.power_settings.sleep_inactive_ac_timeout(),
+            self.power_settings.sleep_inactive_battery_type(),
+            self.power_settings.sleep_inactive_battery_timeout(),
+        )?;
+        Some((
+            sleep.timeout,
+            only_if(&sleep_guards(sleep.action, false), sleep.action),
+        ))
+    }
+
     /// Whether to lock the screen before the system sleeps. Keeps locking
     /// when the installed screensaver schema lacks the Ubuntu key.
     fn lock_on_suspend(&self) -> bool {
@@ -314,13 +476,8 @@ impl Manager {
     /// only the one of the power source in use is armed; the manager re-arms
     /// the timers when the source changes. None when there is nothing to
     /// arm: the type is nothing (or interactive), or the timeout is 0, which
-    /// means never.
-    ///
-    /// A suspend or hibernate action is left out while a GNOME application
-    /// inhibits suspend: that inhibition holds back automatic suspend only,
-    /// so logind's lock for it is weak and explicit requests (power button,
-    /// keybinding) still go through. The manager re-arms the timers when the
-    /// inhibitor goes away.
+    /// means never. What holds the action back is checked when it is due
+    /// (see [`Self::sleep_cmds`]).
     fn sleep_timeout(
         ctx: IdleContext,
         ac_type: SleepInactiveAcType,
@@ -328,24 +485,11 @@ impl Manager {
         battery_type: SleepInactiveBatteryType,
         battery_timeout: i32,
     ) -> Option<SleepTimeout> {
-        let ((action, resume), timeout, sleeps) = if ctx.on_battery {
-            use SleepInactiveBatteryType::*;
-            (
-                Self::battery_sleep_cmds(battery_type),
-                battery_timeout,
-                matches!(battery_type, Suspend | Hibernate),
-            )
+        let ((action, resume), timeout) = if ctx.on_battery {
+            (Self::battery_sleep_cmds(battery_type), battery_timeout)
         } else {
-            use SleepInactiveAcType::*;
-            (
-                Self::ac_sleep_cmds(ac_type),
-                ac_timeout,
-                matches!(ac_type, Suspend | Hibernate),
-            )
+            (Self::ac_sleep_cmds(ac_type), ac_timeout)
         };
-        if sleeps && ctx.suspend_inhibited {
-            return None;
-        }
         Some(SleepTimeout {
             timeout: u32::try_from(timeout).ok().filter(|t| *t > 0)?,
             action: action?,
@@ -422,6 +566,36 @@ impl Manager {
     }
 }
 
+/// What is done before the first swayidle starts: taking logind's power-key
+/// and lid lock, and bringing the session's inhibitor locks in line.
+///
+/// swayidle (1.9.0) sets itself up with blocking D-Bus calls, and answers
+/// some signals with them; a signal that arrives during one waits until the
+/// next one comes in, and holds that one back in turn. A change of logind's
+/// `BlockInhibited` while swayidle sets itself up could so make it miss the
+/// next `PrepareForSleep` or `Lock`: with stay awake on at login, the screen
+/// was then not locked and turned off before the sleep. So at startup the
+/// locks are taken before swayidle starts, and swayidle finds them in place.
+const STARTUP_STEPS: usize = 2;
+
+/// How long the first swayidle waits for the [`STARTUP_STEPS`] at most.
+const STARTUP_WAIT: Duration = Duration::from_secs(2);
+
+impl IdleState {
+    /// Wait until the [`STARTUP_STEPS`] are done, or for [`STARTUP_WAIT`].
+    async fn startup(&self) {
+        let steps = async {
+            for _ in 0..STARTUP_STEPS {
+                if self.startup_steps.recv().await.is_err() {
+                    break;
+                }
+            }
+        };
+        let steps = std::pin::pin!(steps);
+        let _ = future::select(steps, glib::timeout_future(STARTUP_WAIT)).await;
+    }
+}
+
 /// Ask [`Manager::run`] to restart swayidle with the current settings.
 ///
 /// Never blocks. The receiver runs on this same main context, so waiting
@@ -468,6 +642,313 @@ mod reload_tests {
 /// has to be quoted, or the shell replaces it with the file names there.
 const DISPLAY_OFF: &str = "swaymsg output '*' dpms off";
 const DISPLAY_ON: &str = "swaymsg output '*' dpms on";
+
+/// Where the idle dim keeps the brightness to restore, until it is restored.
+const DIM_SAVED_BRIGHTNESS: &str = "$XDG_RUNTIME_DIR/screen_brightness_old.var";
+
+/// Shell command that restores the brightness saved by the idle dim, once:
+/// with no dim since the last restore (or a dim left out), there is none.
+fn restore_dim_cmd() -> String {
+    format!(
+        "if [ -e {DIM_SAVED_BRIGHTNESS} ]; then \
+         light -S $(cat {DIM_SAVED_BRIGHTNESS}); rm -f {DIM_SAVED_BRIGHTNESS}; fi"
+    )
+}
+
+/// Shell command that undoes what swayidle's timeouts did: it restores the
+/// brightness from before a dim and turns the outputs on, as
+/// gnome-settings-daemon does when it goes back to its normal idle mode.
+///
+/// Run when an idle inhibitor holds idleness back again, say after an
+/// unlock. swayidle then lets go of its timeouts without running their
+/// resume commands, and won't see the input that would have run them; so
+/// the idle marks go too. Restarting it instead would run them, but would
+/// leave a moment in which no swayidle follows logind, and a sleep then
+/// would go without the before-sleep commands.
+fn wake_cmd() -> String {
+    format!(
+        "{}; rm -f \"{LOCKED_BLANK_MARK}\" {IDLE_MARK} {SLEEP_DUE_MARK} \"{SLEEP_HELD_UNTIL}\"; \
+         {DISPLAY_ON}",
+        restore_dim_cmd()
+    )
+}
+
+/// Run the shell command `cmd` and reap it, waiting for at most 5 seconds.
+/// `what` it does goes into the warning if it cannot start.
+async fn run_shell(cmd: &str, what: &str) {
+    let mut child = match Command::new("sh").arg("-c").arg(cmd).spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            g_log!(glib::LogLevel::Warning, "Cannot {what}: {e}");
+            return;
+        }
+    };
+    for _ in 0..50 {
+        match child.try_wait() {
+            Ok(None) => glib::timeout_future(Duration::from_millis(100)).await,
+            _ => return,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Shell command that prints the session manager's property `$name` as
+/// busctl does (`b true`, `u 8`), waiting for an answer for 2 seconds at
+/// most; nothing without one.
+macro_rules! session_manager_property {
+    ($name:literal) => {
+        concat!(
+            "timeout 2 busctl --user get-property org.gnome.SessionManager ",
+            "/org/gnome/SessionManager org.gnome.SessionManager ",
+            $name,
+            " 2>/dev/null"
+        )
+    };
+}
+
+/// Shell test: no GNOME application inhibits the actions of bit `$bit` of
+/// the session manager's `InhibitedActions`. Without a session manager to ask,
+/// or an answer in time, none does.
+macro_rules! not_inhibited {
+    ($bit:literal) => {
+        concat!(
+            "{ a=$(",
+            session_manager_property!("InhibitedActions"),
+            ") && a=${a#u } && [ \"$a\" -eq \"$a\" ] 2>/dev/null || a=0; ",
+            "[ $((a & ",
+            $bit,
+            ")) -eq 0 ]; }"
+        )
+    };
+}
+
+/// Shell test: `SessionIsActive` does not read false. No session manager to
+/// ask, or no answer within 2 seconds, counts as active.
+const SESSION_IN_FOREGROUND: &str = concat!(
+    "[ \"$(",
+    session_manager_property!("SessionIsActive"),
+    ")\" != \"b false\" ]"
+);
+
+/// Shell test: no GNOME application inhibits idleness (the idle bit, 8).
+const IDLE_NOT_INHIBITED: &str = not_inhibited!(8);
+
+/// Shell test: no GNOME application inhibits suspend (the suspend bit, 4).
+const SUSPEND_NOT_INHIBITED: &str = not_inhibited!(4);
+
+/// What holds the sleep-inactive `action` back, as shell tests: a session
+/// in the background, an idle inhibitor (locked or not), with `held` the
+/// hold [`sleep_from`] sets, and for suspend and hibernate a suspend
+/// inhibitor.
+fn sleep_guards(action: &str, held: bool) -> Vec<&'static str> {
+    let mut tests = vec![SESSION_IN_FOREGROUND, IDLE_NOT_INHIBITED];
+    if held {
+        tests.push(SLEEP_NOT_HELD);
+    }
+    if matches!(action, "systemctl suspend" | "systemctl hibernate") {
+        tests.push(SUSPEND_NOT_INHIBITED);
+    }
+    tests
+}
+
+/// The sleep-inactive `action` as swayidle runs it, with what holds it back
+/// (see [`sleep_guards`]) checked first. A single line.
+fn guarded_sleep_cmd(action: &str) -> String {
+    only_if(&sleep_guards(action, true), action)
+}
+
+/// [`SLEEP_HELD_UNTIL`], for `concat!`.
+macro_rules! sleep_held_until {
+    () => {
+        "$XDG_RUNTIME_DIR/regolith-powerd-sleep-held-until"
+    };
+}
+
+/// Holds the sleep-inactive action back until the time in it (whole
+/// seconds since the epoch), see [`sleep_from`].
+const SLEEP_HELD_UNTIL: &str = sleep_held_until!();
+
+/// Shell test: [`SLEEP_HELD_UNTIL`] holds no time still to come.
+const SLEEP_NOT_HELD: &str = concat!(
+    "! { h=$(cat \"",
+    sleep_held_until!(),
+    "\" 2>/dev/null) && [ \"$h\" -eq \"$h\" ] 2>/dev/null ",
+    "&& [ \"$(date +%s)\" -lt \"$h\" ]; }"
+);
+
+/// Shell command that runs `cmd` only if every one of the shell `tests` holds.
+/// It is a single line if `cmd` is.
+fn only_if(tests: &[&str], cmd: &str) -> String {
+    format!("if {}; then {cmd}; fi", tests.join(" && "))
+}
+
+#[cfg(test)]
+mod session_guard_tests {
+    use super::{only_if, sleep_guards, IDLE_NOT_INHIBITED, SESSION_IN_FOREGROUND, SLEEP_NOT_HELD};
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+
+    /// Run `only_if(tests, "echo ran")` through `sh -c`, as swayidle does,
+    /// with a stand-in busctl that answers for `org.gnome.SessionManager`
+    /// with `active` and `actions` (None: the session manager is not on the
+    /// bus), and `XDG_RUNTIME_DIR` holding the sleep hold `held_until` (if
+    /// any). Returns whether the command ran.
+    fn runs(
+        name: &str,
+        tests: &[&str],
+        active: bool,
+        actions: Option<&str>,
+        held_until: Option<&str>,
+    ) -> bool {
+        let dir = std::env::temp_dir().join(format!(
+            "regolith-powerd-test-{}-guard-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let busctl = match actions {
+            None => "#!/bin/sh\necho 'Failed to get property' >&2\nexit 1\n".to_string(),
+            Some(actions) => format!(
+                "#!/bin/sh\n\
+                 [ \"$1 $2 $3 $4 $5\" = \"--user get-property org.gnome.SessionManager /org/gnome/SessionManager org.gnome.SessionManager\" ] || exit 2\n\
+                 case $6 in SessionIsActive) echo 'b {active}';; InhibitedActions) echo '{actions}';; *) exit 2;; esac\n"
+            ),
+        };
+        fs::write(dir.join("busctl"), busctl).unwrap();
+        fs::set_permissions(dir.join("busctl"), fs::Permissions::from_mode(0o755)).unwrap();
+        if let Some(held_until) = held_until {
+            fs::write(dir.join("regolith-powerd-sleep-held-until"), held_until).unwrap();
+        }
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(only_if(tests, "echo ran"))
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout).trim() == "ran"
+    }
+
+    #[test]
+    fn session_tests_ask_the_session_manager() {
+        let usual = [SESSION_IN_FOREGROUND, IDLE_NOT_INHIBITED];
+        let foreground = [SESSION_IN_FOREGROUND];
+        let sleep = sleep_guards("poweroff", false);
+        let suspend = sleep_guards("systemctl suspend", false);
+        // (tests, session active, InhibitedActions, runs)
+        type Case<'a> = (&'a [&'a str], bool, Option<&'a str>, bool);
+        let cases: [Case; 20] = [
+            (&usual, true, Some("u 0"), true),
+            (&usual, true, Some("u 4"), true),
+            // logging out is not idleness
+            (&usual, true, Some("u 1"), true),
+            (&usual, true, Some("u 8"), false),
+            (&usual, true, Some("u 12"), false),
+            (&usual, false, Some("u 0"), false),
+            // Nothing to ask: as without inhibitors, in the foreground
+            (&usual, true, None, true),
+            (&usual, true, Some("garbage"), true),
+            (&foreground, true, Some("u 8"), true),
+            (&foreground, false, Some("u 0"), false),
+            (&foreground, false, None, true),
+            // The sleep-inactive action: held back by an idle inhibitor
+            (&sleep, true, Some("u 0"), true),
+            (&sleep, true, Some("u 4"), true),
+            (&sleep, true, Some("u 8"), false),
+            (&sleep, false, Some("u 0"), false),
+            // Suspend and hibernate: also held back by a suspend inhibitor
+            (&suspend, true, Some("u 0"), true),
+            (&suspend, true, Some("u 4"), false),
+            (&suspend, true, Some("u 8"), false),
+            (&suspend, true, Some("u 12"), false),
+            (&suspend, true, None, true),
+        ];
+        for (i, (tests, active, actions, ran)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                runs(&i.to_string(), tests, active, actions, None),
+                ran,
+                "case {i}: active {active}, InhibitedActions {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sleep_hold_holds_until_its_time() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let held = |name: &str, until: Option<String>| {
+            !runs(name, &[SLEEP_NOT_HELD], true, Some("u 0"), until.as_deref())
+        };
+        assert!(held("future", Some(format!("{}\n", now + 60))));
+        assert!(!held("past", Some(format!("{}\n", now - 1))));
+        assert!(!held("none", None));
+        assert!(!held("garbage", Some("soon\n".into())));
+        // swayidle runs the action guarded with the hold; the daemon's own
+        // count from the inhibitor's drop leaves its hold out.
+        assert!(sleep_guards("poweroff", true).contains(&SLEEP_NOT_HELD));
+        assert!(!sleep_guards("poweroff", false).contains(&SLEEP_NOT_HELD));
+    }
+
+    #[test]
+    fn wake_undoes_the_dim_and_the_blanks() {
+        use super::wake_cmd;
+        let dir =
+            std::env::temp_dir().join(format!("regolith-powerd-test-{}-wake", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for tool in ["light", "swaymsg"] {
+            fs::write(
+                bin.join(tool),
+                format!("#!/bin/sh\necho {tool} \"$*\" >> \"$XDG_RUNTIME_DIR/calls\"\n"),
+            )
+            .unwrap();
+            fs::set_permissions(bin.join(tool), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let run = || {
+            let _ = fs::remove_file(dir.join("calls"));
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg(wake_cmd())
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("XDG_RUNTIME_DIR", &dir)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            fs::read_to_string(dir.join("calls")).unwrap()
+        };
+        // Dimmed and blanked on the locked screen: both undone, once.
+        fs::write(dir.join("screen_brightness_old.var"), "70\n").unwrap();
+        fs::write(dir.join("regolith-powerd-locked-blank"), "").unwrap();
+        fs::write(dir.join("regolith-powerd-idle"), "").unwrap();
+        fs::write(dir.join("regolith-powerd-sleep-due"), "").unwrap();
+        fs::write(dir.join("regolith-powerd-sleep-held-until"), "1\n").unwrap();
+        assert_eq!(run(), "light -S 70\nswaymsg output * dpms on\n");
+        assert!(!dir.join("screen_brightness_old.var").exists());
+        assert!(!dir.join("regolith-powerd-locked-blank").exists());
+        assert!(!dir.join("regolith-powerd-idle").exists());
+        assert!(!dir.join("regolith-powerd-sleep-due").exists());
+        assert!(!dir.join("regolith-powerd-sleep-held-until").exists());
+        // Nothing to restore: the outputs just go on.
+        assert_eq!(run(), "swaymsg output * dpms on\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn guarded_commands_stay_single_lines() {
+        let cmd = only_if(&[SESSION_IN_FOREGROUND, IDLE_NOT_INHIBITED], "true");
+        assert!(!cmd.contains('\n'));
+        let status = Command::new("sh")
+            .args(["-n", "-c", &format!("true;{cmd};true")])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{cmd}");
+    }
+}
 
 #[cfg(test)]
 mod display_cmd_tests {
@@ -520,7 +1001,123 @@ const LOCKED_BLANK_SECS: u32 = 30;
 
 /// Idle seconds after which the outputs turn off when the screen was locked
 /// after the user's last input (the lock key, or the lid).
-const JUST_LOCKED_BLANK_SECS: u32 = 5;
+pub(crate) const JUST_LOCKED_BLANK_SECS: u32 = 5;
+
+/// Present while the user has been idle for [`JUST_LOCKED_BLANK_SECS`] or
+/// more (see [`idle_mark_args`]).
+const IDLE_MARK: &str = "$XDG_RUNTIME_DIR/regolith-powerd-idle";
+
+/// Present while the sleep-inactive timeout has passed with no input since.
+const SLEEP_DUE_MARK: &str = "$XDG_RUNTIME_DIR/regolith-powerd-sleep-due";
+
+/// The file a `$XDG_RUNTIME_DIR/...` path of the shell commands names here.
+fn runtime_path(shell_path: &str) -> Option<PathBuf> {
+    let name = shell_path.strip_prefix("$XDG_RUNTIME_DIR/")?;
+    Some(PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join(name))
+}
+
+/// Whether the mark `shell_path` is present and was made no later than
+/// `at`: the user has been idle since then at least.
+fn marked_since(shell_path: &str, at: Instant) -> bool {
+    let made = runtime_path(shell_path)
+        .and_then(|path| fs::metadata(path).ok())
+        .and_then(|meta| meta.modified().ok());
+    let at = SystemTime::now().checked_sub(at.elapsed());
+    matches!((made, at), (Some(made), Some(at)) if made <= at)
+}
+
+/// The swayidle timeout that keeps [`IDLE_MARK`] while the user is idle.
+fn idle_mark_args() -> Vec<String> {
+    let mut args = Manager::get_timeout_cmd(JUST_LOCKED_BLANK_SECS, &format!("touch {IDLE_MARK}"));
+    args.append(&mut Manager::get_resume_cmd(&format!("rm -f {IDLE_MARK}")));
+    args
+}
+
+/// Turn the outputs off on a screen locked at `locked_since` while an idle
+/// inhibitor is held, [`JUST_LOCKED_BLANK_SECS`] after the lock, when the
+/// user has not come back since: the session gathers no idle time while
+/// idleness is held back, so the lock screen starts from the lock.
+///
+/// swayidle does this itself when its idle count starts at the lock (see
+/// [`blank_while_locked_args`]). It cannot when the user had been idle for a
+/// while before the lock and the stay-awake request only came afterwards:
+/// its short timeout has passed by then, and it only has one idle count,
+/// which the sleep-inactive action has to keep.
+pub(crate) async fn blank_fresh_lock(locked_since: Instant) {
+    let since_lock = locked_since + Duration::from_secs(JUST_LOCKED_BLANK_SECS.into());
+    let blanked = runtime_path(LOCKED_BLANK_MARK).is_some_and(|path| path.exists());
+    if !blanked && marked_since(IDLE_MARK, since_lock) {
+        run_shell(&blank_while_locked_cmd(None), "turn the screen off").await;
+    }
+}
+
+/// Run the sleep-inactive `action` now, when a suspend inhibitor went away
+/// on a locked screen at `since` and the timeout had passed already with no
+/// input since: the action was held back when it was due, and swayidle
+/// won't run it again before the next input. When the timeout has not
+/// passed yet, swayidle runs it when it does, with nothing holding it back
+/// any more, so the action keeps the deadline it had.
+///
+/// Restarting swayidle for the change instead, as on an unlocked screen,
+/// would turn the outputs on and start the lock screen's delays over.
+async fn run_overdue_sleep(since: Instant, action: &str) {
+    if marked_since(SLEEP_DUE_MARK, since) {
+        run_shell(action, "run the sleep-inactive action").await;
+    }
+}
+
+/// Hold the sleep-inactive action back until `timeout` seconds after
+/// `since`, when an idle inhibitor went away on a locked screen then (see
+/// [`sleep_from`]). Returns that deadline and the hold written to
+/// [`SLEEP_HELD_UNTIL`]: the deadline's whole second.
+fn hold_sleep(since: Instant, timeout: u32) -> (SystemTime, SystemTime) {
+    let at = SystemTime::now()
+        .checked_sub(since.elapsed())
+        .unwrap_or_else(SystemTime::now);
+    let due = at + Duration::from_secs(timeout.into());
+    let secs = due
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Some(path) = runtime_path(SLEEP_HELD_UNTIL) {
+        if let Err(e) = fs::write(&path, format!("{secs}\n")) {
+            g_log!(
+                glib::LogLevel::Warning,
+                "Cannot hold the sleep-inactive action back: {e}"
+            );
+        }
+    }
+    (due, SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+/// Run the sleep-inactive `action` (guarded, see [`Manager::sleep_from_cmd`])
+/// at `due`, `timeout` seconds after an idle inhibitor went away on a locked
+/// screen at `since`, as the X11 session counts idle time from that moment:
+/// unless the user came back meanwhile, or a later such moment took over in
+/// `counts_from`.
+///
+/// swayidle keeps its own count from the last input. Its timeout may have
+/// passed already (the action was held back then) or may come before `due`;
+/// [`SLEEP_HELD_UNTIL`] holds the action back until `hold`, `due`'s whole
+/// second. A mark from a timeout that swayidle held back, made before
+/// `hold` and not removed by input since, means no input since `since`: the
+/// action runs here. A timeout after `hold` (after input since `since`, or
+/// within the last second before `due`) runs it in swayidle.
+async fn sleep_from(
+    since: Instant,
+    due: SystemTime,
+    hold: SystemTime,
+    action: &str,
+    counts_from: &Cell<Option<Instant>>,
+) {
+    glib::timeout_future(due.duration_since(SystemTime::now()).unwrap_or_default()).await;
+    let held_back = runtime_path(SLEEP_DUE_MARK)
+        .and_then(|path| fs::metadata(path).ok())
+        .and_then(|meta| meta.modified().ok())
+        .is_some_and(|made| made < hold);
+    if counts_from.get() == Some(since) && held_back {
+        run_shell(action, "run the sleep-inactive action").await;
+    }
+}
 
 /// Marks that the outputs were turned off by [`blank_while_locked_args`], so
 /// that only then does coming back turn them on.
@@ -563,6 +1160,7 @@ fn blank_while_locked_args() -> Vec<String> {
 
 /// Shell command that turns the outputs off if the screen is locked and,
 /// with `locked_for_at_most`, has been locked for no more seconds than that.
+/// A session in the background leaves them alone.
 fn blank_while_locked_cmd(locked_for_at_most: Option<u32>) -> String {
     const CALL: &str =
         "busctl --user call org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver";
@@ -573,7 +1171,7 @@ fn blank_while_locked_cmd(locked_for_at_most: Option<u32>) -> String {
         None => String::new(),
     };
     format!(
-        "if [ \"$({CALL} GetActive 2>/dev/null)\" = \"b true\" ]{recently}; then \
+        "if {SESSION_IN_FOREGROUND} && [ \"$({CALL} GetActive 2>/dev/null)\" = \"b true\" ]{recently}; then \
          {DISPLAY_OFF} && touch \"{LOCKED_BLANK_MARK}\"; fi"
     )
 }
@@ -860,6 +1458,36 @@ const LOCKER: &str = concat!(
     "exec gtklock -d; }"
 );
 
+/// Let a child started by [`Manager::run`] keep only its standard streams.
+///
+/// swayidle is started again whenever the idle settings change, at any
+/// time, while other threads receive file descriptors that are not
+/// close-on-exec, such as the logind inhibitor locks zbus hands over. A
+/// swayidle that inherits one holds the lock after the daemon released it
+/// or exited, which keeps the power key and the lid away from logind. Runs
+/// in the child, between fork and exec, so it only makes system calls.
+fn close_inherited_fds_on_exec() {
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+    // SAFETY: close_range(2) and fcntl(2) only change fd flags.
+    unsafe {
+        if libc::syscall(
+            libc::SYS_close_range,
+            3,
+            libc::c_uint::MAX,
+            CLOSE_RANGE_CLOEXEC,
+        ) != 0
+        {
+            // Kernels before 5.11
+            for fd in 3..1024 {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
+    }
+}
+
 /// Stop a swayidle started by [`Manager::run`] and reap it.
 ///
 /// On SIGTERM swayidle runs the resume command of every timeout that has
@@ -902,18 +1530,13 @@ struct SleepTimeout {
 #[cfg(test)]
 mod idle_tests {
     use super::{
-        IdleContext, IdleState, Manager, SleepInactiveAcType as Ac,
+        guarded_sleep_cmd, IdleContext, IdleState, Manager, SleepInactiveAcType as Ac,
         SleepInactiveBatteryType as Battery, SleepTimeout, DISPLAY_OFF, DISPLAY_ON,
+        SUSPEND_NOT_INHIBITED,
     };
 
-    const ON_AC: IdleContext = IdleContext {
-        on_battery: false,
-        suspend_inhibited: false,
-    };
-    const ON_BATTERY: IdleContext = IdleContext {
-        on_battery: true,
-        suspend_inhibited: false,
-    };
+    const ON_AC: IdleContext = IdleContext { on_battery: false };
+    const ON_BATTERY: IdleContext = IdleContext { on_battery: true };
 
     #[test]
     fn only_the_sleep_action_of_the_power_source_in_use_is_armed() {
@@ -958,37 +1581,22 @@ mod idle_tests {
 
     #[test]
     fn idle_suspend_and_hibernate_are_held_back_while_suspend_is_inhibited() {
-        let inhibited = |on_battery| IdleContext {
-            on_battery,
-            suspend_inhibited: true,
-        };
-        for ctx in [inhibited(false), inhibited(true)] {
+        // Checked when the action is due: the timeout stays armed.
+        for ctx in [ON_AC, ON_BATTERY] {
             for (ac, battery) in [
                 (Ac::Suspend, Battery::Suspend),
                 (Ac::Hibernate, Battery::Hibernate),
             ] {
-                assert_eq!(Manager::sleep_timeout(ctx, ac, 60, battery, 60), None);
+                let sleep = Manager::sleep_timeout(ctx, ac, 60, battery, 60).unwrap();
+                assert!(guarded_sleep_cmd(sleep.action).contains(SUSPEND_NOT_INHIBITED));
             }
         }
         // The other actions go on.
-        let blank = SleepTimeout {
-            timeout: 60,
-            action: DISPLAY_OFF,
-            resume: Some(DISPLAY_ON),
-        };
-        assert_eq!(
-            Manager::sleep_timeout(inhibited(false), Ac::Blank, 60, Battery::Suspend, 30),
-            Some(blank)
-        );
-        let logout = SleepTimeout {
-            timeout: 30,
-            action: "gnome-session-quit --no-prompt",
-            resume: None,
-        };
-        assert_eq!(
-            Manager::sleep_timeout(inhibited(true), Ac::Suspend, 60, Battery::Logout, 30),
-            Some(logout)
-        );
+        for action in [DISPLAY_OFF, "poweroff", "gnome-session-quit --no-prompt"] {
+            let cmd = guarded_sleep_cmd(action);
+            assert!(!cmd.contains(SUSPEND_NOT_INHIBITED), "{cmd}");
+            assert!(cmd.ends_with(&format!("then {action}; fi")), "{cmd}");
+        }
     }
 
     #[test]
@@ -1161,8 +1769,10 @@ impl PowerSettings {
 }
 fn main() {
     // The lock screen's D-Bus interface, which gnome-flashback provides in
-    // the X11 session. It runs in a thread of its own.
-    screensaver::start();
+    // the X11 session. It runs in a thread of its own, and tells the session
+    // inhibition bridge when the screen locks and unlocks.
+    let (lock_watch, lock_changes) = screensaver::LockWatch::new();
+    screensaver::start(lock_watch.clone());
 
     let app = Application::new(Some("org.regolith.powerd"), ApplicationFlags::IS_SERVICE);
 
@@ -1173,9 +1783,14 @@ fn main() {
     // session.
     let _automount = automount::start();
 
+    let session_settings = Rc::new(SessionSettings::new());
+    let manager = Manager::new(session_settings.clone());
+    let idle = manager.idle_state();
+
     // Take over power-key and lid-switch handling from logind for the
     // daemon's lifetime, once the session main context starts running.
-    glib::spawn_future_local(async {
+    let startup = idle.clone();
+    glib::spawn_future_local(async move {
         match logind::setup_logind_inhibits().await {
             Ok(fd) => {
                 // Intentionally leak the fd: dropping it would release the
@@ -1187,13 +1802,16 @@ fn main() {
                 "Failed to acquire logind inhibitors: {e}"
             ),
         }
+        startup.startup_step_done();
     });
 
     // Bridge GNOME session inhibition to logind, which swayidle already honors.
-    let session_settings = Rc::new(SessionSettings::new());
-    let manager = Manager::new(session_settings.clone());
-    let idle = manager.idle_state();
-    glib::spawn_future_local(session::run_inhibits(session_settings, idle.clone()));
+    glib::spawn_future_local(session::run_inhibits(
+        session_settings,
+        idle.clone(),
+        lock_watch,
+        lock_changes,
+    ));
 
     // Follow the power source, as gnome-settings-daemon does through UPower.
     glib::spawn_future_local(power_source::run(idle));
