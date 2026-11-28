@@ -228,6 +228,9 @@ mod tests {
     use zbus::zvariant::OwnedFd;
     use zbus::{dbus_interface, ConnectionBuilder};
 
+    /// Held by each test that owns the mock well-known names on the bus.
+    static BUS_NAMES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct MockSession(Arc<AtomicU32>);
 
     #[dbus_interface(name = "org.gnome.SessionManager")]
@@ -419,12 +422,79 @@ mod tests {
             eprintln!("skipping: run under dbus-run-session with REGOLITH_POWERD_TEST_BUS=1");
             return;
         }
+        let _names = BUS_NAMES.lock().unwrap_or_else(|e| e.into_inner());
         glib::MainContext::new().block_on(async {
             let exercise = exercise_bridge();
             let watchdog = glib::timeout_future(Duration::from_secs(20));
             pin_mut!(exercise, watchdog);
             if let Either::Right(_) = future::select(exercise, watchdog).await {
                 panic!("bridge test timed out");
+            }
+        });
+    }
+
+    async fn exercise_lock_not_inherited() {
+        let actions = Arc::new(AtomicU32::new(INHIBIT_IDLE));
+        let (send_calls, calls) = async_channel::unbounded();
+        let server = ConnectionBuilder::session()
+            .unwrap()
+            .name("org.gnome.SessionManager")
+            .unwrap()
+            .name("org.freedesktop.login1")
+            .unwrap()
+            .serve_at("/org/gnome/SessionManager", MockSession(actions.clone()))
+            .unwrap()
+            .serve_at("/org/freedesktop/login1", MockLogind(send_calls))
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let client = zbus::Connection::session().await.unwrap();
+        let watch = watch_session_inhibits(&client, &client, || Duration::from_secs(60), |_| {});
+        let sequence = async {
+            let (what, idle) = calls.recv().await.unwrap();
+            assert_eq!(what, "idle");
+            // The mock reports the call before its reply reaches the watcher:
+            // give the watcher time to take the fd.
+            glib::timeout_future(Duration::from_millis(250)).await;
+            // A program started while the lock is held, as swayidle is when
+            // a setting changes.
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            actions.store(0, Ordering::SeqCst);
+            emit_inhibited_actions_changed(&server, 0).await;
+            let released = await_released(idle);
+            let deadline = glib::timeout_future(Duration::from_secs(3));
+            pin_mut!(released, deadline);
+            let held = matches!(future::select(released, deadline).await, Either::Right(_));
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                !held,
+                "the lock was let go but a child process still held it"
+            );
+        };
+        pin_mut!(watch, sequence);
+        if let Either::Left((result, _)) = future::select(watch, sequence).await {
+            panic!("watcher ended early: {result:?}");
+        }
+    }
+
+    #[test]
+    fn a_lock_let_go_is_not_held_by_child_processes() {
+        if std::env::var("REGOLITH_POWERD_TEST_BUS").is_err() {
+            eprintln!("skipping: run under dbus-run-session with REGOLITH_POWERD_TEST_BUS=1");
+            return;
+        }
+        let _names = BUS_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        glib::MainContext::new().block_on(async {
+            let exercise = exercise_lock_not_inherited();
+            let watchdog = glib::timeout_future(Duration::from_secs(20));
+            pin_mut!(exercise, watchdog);
+            if let Either::Right(_) = future::select(exercise, watchdog).await {
+                panic!("inheritance test timed out");
             }
         });
     }
