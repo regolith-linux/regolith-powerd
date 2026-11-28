@@ -19,6 +19,10 @@
 //!   what `loginctl lock-session` does; swayidle then starts the lock screen.
 //! - logind's `Unlock` signal (`loginctl unlock-session`) unlocks: the lock
 //!   screen gets the signal on which it unlocks and exits.
+//!
+//! The rest of the daemon follows the lock state through a [`LockWatch`]: a
+//! GNOME idle inhibitor only counts while the screen is unlocked (see
+//! [`crate::session`]).
 
 use glib::g_log;
 use std::fs;
@@ -98,6 +102,59 @@ impl Default for Config {
 
 /// When the screen was locked, while it is.
 type LockedSince = Arc<Mutex<Option<Instant>>>;
+
+/// Whether, and since when, the screen is locked, for the rest of the daemon.
+/// [`start`] keeps it current, and sends a wake-up through the channel from
+/// [`LockWatch::new`] whenever it changes.
+#[derive(Clone)]
+pub struct LockWatch {
+    since: LockedSince,
+    changed: async_channel::Sender<()>,
+}
+
+impl LockWatch {
+    /// A watch that starts from whether a lock screen of this user runs right
+    /// now, so that a daemon started on a locked screen knows it from the
+    /// start (counting the lock from then), and the receiving end of its
+    /// change wake-ups.
+    pub fn new() -> (Self, async_channel::Receiver<()>) {
+        let config = Config::default();
+        let locked = !find_lockers(&config.proc_root, current_uid(), &config.lockers).is_empty();
+        let (changed, changes) = async_channel::bounded(1);
+        let watch = Self {
+            since: Arc::new(Mutex::new(locked.then(Instant::now))),
+            changed,
+        };
+        (watch, changes)
+    }
+
+    /// When the screen was locked (as far as this daemon knows), while it is.
+    pub fn locked_since(&self) -> Option<Instant> {
+        *self.since.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    fn is_locked(&self) -> bool {
+        self.locked_since().is_some()
+    }
+
+    /// Record the lock state; a change wakes the receiver. Never blocks: a
+    /// wake-up already queued covers this change too, as the receiver reads
+    /// the state itself.
+    fn set(&self, locked: bool) {
+        let changed = {
+            let mut since = self.since.lock().unwrap();
+            let changed = since.is_some() != locked;
+            if changed {
+                *since = locked.then(Instant::now);
+            }
+            changed
+        };
+        if changed {
+            let _ = self.changed.try_send(());
+        }
+    }
+}
 
 struct ScreenSaver {
     locked_since: LockedSince,
@@ -188,10 +245,22 @@ fn unlock(pid: u32, locker: &Locker) {
     }
 }
 
-/// Provide `org.gnome.ScreenSaver` on `session`, for the login session that
-/// logind's `auto` resolves to on `system`. Only returns if that cannot be
-/// set up; later D-Bus errors are logged.
+/// [`serve_watched`] without a [`LockWatch`].
+#[cfg(test)]
 pub fn serve(session: &Connection, system: &Connection, config: Config) -> zbus::Result<()> {
+    serve_watched(session, system, config, None)
+}
+
+/// Provide `org.gnome.ScreenSaver` on `session`, for the login session that
+/// logind's `auto` resolves to on `system`, keeping `watch` (if any) current
+/// with the lock state. Only returns if that cannot be set up; later D-Bus
+/// errors are logged.
+fn serve_watched(
+    session: &Connection,
+    system: &Connection,
+    config: Config,
+    watch: Option<LockWatch>,
+) -> zbus::Result<()> {
     let locked_since = LockedSince::default();
     let login = zbus::block_on(async {
         let path = LoginManagerProxy::new(system)
@@ -244,6 +313,13 @@ pub fn serve(session: &Connection, system: &Connection, config: Config) -> zbus:
             if changed {
                 *since = locked.then(Instant::now);
             }
+            // Before GetActive can answer with the new state, so that what
+            // follows a lock (a stay-awake request, say) finds it recorded.
+            // Every round, not only on a change here: the watch may start
+            // from a lock screen that was gone before the first look.
+            if let Some(watch) = &watch {
+                watch.set(locked);
+            }
             changed
         };
         if changed {
@@ -263,13 +339,15 @@ pub fn serve(session: &Connection, system: &Connection, config: Config) -> zbus:
 }
 
 /// Provide `org.gnome.ScreenSaver` on the user's buses for the lifetime of
-/// the daemon, from a thread of its own.
-pub fn start() {
-    thread::spawn(|| {
+/// the daemon, from a thread of its own, keeping `watch` current.
+pub fn start(watch: LockWatch) {
+    thread::spawn(move || {
         let result = zbus::block_on(async {
             Ok::<_, zbus::Error>((Connection::session().await?, Connection::system().await?))
         })
-        .and_then(|(session, system)| serve(&session, &system, Config::default()));
+        .and_then(|(session, system)| {
+            serve_watched(&session, &system, Config::default(), Some(watch))
+        });
         if let Err(e) = result {
             g_log!(
                 glib::LogLevel::Warning,
@@ -315,6 +393,31 @@ mod tests {
         assert!(find_lockers(&root, current_uid().wrapping_add(1), &lockers).is_empty());
         assert!(find_lockers(&root.join("missing"), current_uid(), &lockers).is_empty());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn lock_watch_wakes_only_on_changes() {
+        let (changed, changes) = async_channel::bounded(1);
+        let watch = LockWatch {
+            since: LockedSince::default(),
+            changed,
+        };
+        watch.set(false);
+        assert!(changes.try_recv().is_err());
+        watch.set(true);
+        assert!(watch.is_locked());
+        // The lock counts from when it was first seen, not from every look.
+        let since = watch.locked_since();
+        watch.set(true);
+        assert_eq!(watch.locked_since(), since);
+        assert_eq!(changes.try_recv(), Ok(()));
+        // Changes while a wake-up is queued neither block nor queue another:
+        // the receiver reads the latest state.
+        watch.set(false);
+        watch.set(true);
+        assert_eq!(changes.try_recv(), Ok(()));
+        assert!(changes.try_recv().is_err());
+        assert!(watch.is_locked());
     }
 
     struct Bus(Child);

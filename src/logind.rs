@@ -14,6 +14,10 @@ pub const WHO: &str = "regolith-powerd";
 pub trait Logind {
     #[allow(non_snake_case)]
     fn Inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<OwnedFd>;
+
+    /// Sent before the system sleeps (`start` true) and once it has resumed.
+    #[dbus_proxy(signal)]
+    fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;
 }
 
 /// Keep an inhibitor fd out of the programs this daemon starts (swayidle,
@@ -64,6 +68,11 @@ impl Lock {
             mode,
             fd: None,
         }
+    }
+
+    /// Whether the lock is held.
+    pub fn is_held(&self) -> bool {
+        self.fd.is_some()
     }
 
     /// Release the lock when `wanted` is false, take it when true and not yet
